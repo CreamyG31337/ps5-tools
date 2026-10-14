@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+# Local config and scan output
+ps5-ip.txt
+*.json
+!**/tests/**/*.json
+# Never commit console or game files
+*.pkg
+*.self
+*.prx
+*.sprx
+*.elf
+*.bin
