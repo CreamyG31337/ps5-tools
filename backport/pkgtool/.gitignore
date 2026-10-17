@@ -1,0 +1,4 @@
+unbundled/
+*.exe
+*.zip
+__pycache__/
