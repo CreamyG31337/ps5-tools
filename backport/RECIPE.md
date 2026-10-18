@@ -48,10 +48,14 @@ python backport.py game.pkg --exports fw403-exports.tsv --nids nids.csv --out wo
 (or a folder: `python backport.py D:\dumps\GAME-app0 ...`). For every executable it:
 
 1. lowers the module/process param SDK version to `--sdk`;
-2. fixes known struct-size changes before calls (`shims.STRUCT_SIZES`);
+2. fixes known struct-size changes before calls (`shims.STRUCT_SIZES`), and arguments an
+   exported function's older version rejects (`shims.ARG_FIXUPS`, run in the PLT stub);
 3. finds imports the target doesn't export (skipping libraries the game ships itself) and
    gives each called one a stand-in: an older NID of the same function (`RENAMES`), a
-   100 µs sleep for futex waits (`SLEEP_WAITS`), a known shim (`KNOWN`), or `return 0`.
+   real futex wait/wake through FreeBSD's `_umtx_op` for the sync-on-address functions
+   (`UMTX_SHIMS` — each stub jumps to a trampoline appended to the module's exec segment,
+   which converts the microsecond timeout into the timespec `_umtx_op` takes, so timed
+   waits sleep in the kernel too), a known shim (`KNOWN`), or `return 0`.
 
 The output is `work\overlay\` (same paths as app0) and `work\report.txt`. **Read the report.**
 Every `ret 0` line is a guess, and the first place to look when something misbehaves. Lines
@@ -80,7 +84,9 @@ unmount and rebooted the console. Get files from the package or dump on the PC i
 | runs, black screen, no crash | usually a refused plugin (Unity: `element_lookup() error=2` lines for `Plugins/...`) | make sure every `.prx` was processed and uploaded |
 | a feature fails after `ret 0` | the stand-in needs real behaviour (an out-parameter, a handle) | write a `KNOWN` shim in `shims.py` |
 | a call returns an error with valid arguments | interface change: a bigger struct, a new argument | add a `STRUCT_SIZES` entry, or a shim |
-| hang in a wait | a missing wait/wake pair | see `SLEEP_WAITS` |
+| a call fails with a generic parameter error and the service never logs the request | the older client library rejects a newer-SDK default before sending (e.g. Mount3's systemBlocks = -1) | find the check in the target's library; add an `ARG_FIXUPS` entry |
+| hang in a wait | a missing wait/wake pair | see `UMTX_SHIMS` |
+| whole console laggy, system UI "no heart beat" in the log | game threads busy-polling (e.g. a wait stubbed to return at once or sleep briefly) | dump the threads; give the wait a real blocking stand-in |
 
 To see what a thread is doing, a debugger that can read registers and stacks of all threads
 (ptrace `PT_GETLWPLIST`/`PT_GETREGS`) helps a lot. Check the obvious first: "stuck" may be a
@@ -112,9 +118,19 @@ matter. The other two are now in `shims.py`.
 PS5Util, 6 plugins and one Sony library the game ships. It found 17 missing functions:
 - **eboot (9):** two PS5 Pro checks, two VRR calls and an HTTP/2 setter → `return 0`;
   two GPU functions renamed to their older NIDs; two shims.
-- **libc and PS5Util (6):** `sceKernelSyncOnAddressWait`/`Wake` and related functions → 100 µs
-  sleeps and `return 0`.
+- **libc and PS5Util (6):** `sceKernelSyncOnAddressWait`/`Wake` and related functions → real
+  futex waits and wakes through `_umtx_op`, with a small trampoline appended to each module's
+  exec segment converting the microsecond timeout into the timespec `_umtx_op` takes. Untimed
+  waits and waits longer than a second recheck once a second; everything else sleeps in the
+  kernel until the value changes or a `Wake` arrives.
 - **audio plugin (1):** a 3D-latency setter → `return 0`.
 
 It also fixed one struct size. The game ran with nothing else. It logs that the temporary-data
 mount (`/temp0`) fails, which turned out to be harmless.
+
+Saving did not work at first: every `sceSaveDataMount3` returned 0x809F0000 and the save
+service never logged the request. The save plugin (Unity savedata, SDK 10) passes
+systemBlocks = -1, and the 4.03 client wrapper requires 0 when creating a save. It checks this
+before sending anything. The SDK version was ruled out first: the same failure happened with
+the whole overlay at 0x04030000. `ARG_FIXUPS` now zeroes the field in Mount3's PLT stub, and
+saving and Continue work.

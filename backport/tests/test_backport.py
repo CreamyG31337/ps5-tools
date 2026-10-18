@@ -3,7 +3,7 @@
 No Sony or game data: the module below is assembled byte by byte. It imports
   -sD02mFDBh4 (sceUserServiceGetGamePresets, exported, called with a struct size of 0x30),
   zzzzzzzzzzz from libFoo (missing on the "target", called -> return 0),
-  Hc4CaR6JBL0 (sceKernelSyncOnAddressWait, missing, called -> 100 us sleep),
+  Hc4CaR6JBL0 (sceKernelSyncOnAddressWait, missing, called -> _umtx_op wait),
   yyyyyyyyyyy from libFoo (missing, never called: no PLT stub),
 and has a proc param with SDK 0x10000040.
 """
@@ -82,13 +82,13 @@ def build_module():
     data = bytearray(DATA_SZ)
     data[0x10:0x10 + 0x60] = struct.pack("<Q4sIII", 0x60, b"ORBI", 5, 0x12090001, 0x10000040).ljust(0x60, b"\x00")
 
-    phs = [(1, 5, TEXT_OFF, TEXT_VA, TEXT_SZ), (1, 6, DATA_OFF, DATA_VA, DATA_SZ),
-           (1, 0, DYNS_OFF, DYNS_VA, DYNS_SZ),
-           (2, 6, DYNS_OFF + dyn_at, DYNS_VA + dyn_at, len(dyn))]
+    phs = [(1, 5, TEXT_OFF, TEXT_VA, TEXT_SZ, 0x1000), (1, 6, DATA_OFF, DATA_VA, DATA_SZ, 0x10),
+           (1, 0, DYNS_OFF, DYNS_VA, DYNS_SZ, 0x10),
+           (2, 6, DYNS_OFF + dyn_at, DYNS_VA + dyn_at, len(dyn), 0x10)]
     ehdr = bytearray(64)
     ehdr[:7] = b"\x7fELF\x02\x01\x01"
     struct.pack_into("<HHIQQQIHHHHHH", ehdr, 0x10, 0xFE18, 0x3E, 1, 0, 64, 0, 0, 64, 56, len(phs), 0, 0, 0)
-    phdr = b"".join(struct.pack("<IIQQQQQQ", t, f, o, v, v, s, s, 0x10) for t, f, o, v, s in phs)
+    phdr = b"".join(struct.pack("<IIQQQQQQ", t, f, o, v, v, s, s, al) for t, f, o, v, s, al in phs)
     flat = bytearray(DYNS_OFF + DYNS_SZ)
     flat[0:64] = ehdr
     flat[64:64 + len(phdr)] = phdr
@@ -120,7 +120,7 @@ def wr(path, data):
 
 def write_exports(path):
     rows = [("libSceUserService.sprx", "libSceUserService", "libSceUserService", "-sD02mFDBh4", ""),
-            ("libkernel.sprx", "libkernel", "libkernel", shims.USLEEP, "sceKernelUsleep"),
+            ("libkernel.sprx", "libkernel", "libkernel", shims.UMTX_OP, "_umtx_op"),
             ("libFoo.sprx", "libFoo", "libFoo", "xxxxxxxxxxx", "")]
     with open(path, "w", encoding="utf-8") as f:
         f.write("module_file\tmodule\tlibrary\tnid\tname\n")
@@ -158,17 +158,69 @@ class TestShims(unittest.TestCase):
         self.assertEqual(shims.rename_import(dup, "abcdefghijk", "ABCDEFGHIJK"), 2)
         self.assertNotIn(b"ABCDEFGHIJK", dup)  # ambiguous: left alone
 
-    def test_sleep_stub(self):
+    def test_umtx_stub(self):
         stub = b"\xff\x25" + struct.pack("<i", 0x1000)
-        new = shims.sleep_stub(stub)
+        for op, pre in ((shims.UMTX_WAIT, "4889f2 6a025e 4531c0"), (shims.UMTX_WAKE, "89f2 6a035e 4531c0")):
+            new = shims.umtx_stub(stub, op)
+            pre = bytes.fromhex(pre.replace(" ", ""))
+            self.assertEqual(len(new), 16)
+            self.assertEqual(new[:len(pre)], pre)
+            self.assertEqual(new[len(pre):len(pre) + 2], b"\xff\x25")
+            # the jmp ends len(pre) bytes later and must still reach the same GOT slot
+            disp = struct.unpack_from("<i", new, len(pre) + 2)[0]
+            self.assertEqual(len(pre) + 6 + disp, 6 + 0x1000)
+
+    def test_umtx_stubs_paired(self):
+        old = lambda got_disp: (b"\xff\x25" + struct.pack("<i", got_disp)).ljust(16, b"\x90")
+        out = shims.umtx_stubs({0x100: (shims.UMTX_WAIT, old(0x2000)), 0x110: (shims.UMTX_WAKE, old(0x1ff8))})
+        wait, wake = out[0x100], out[0x110]
+        self.assertEqual((len(wait), len(wake)), (16, 16))
+        self.assertEqual(wait[:5], bytes.fromhex("4885d27508"))        # test rdx,rdx; jnz +8
+        self.assertEqual(wait[13:16], shims.RET0)                       # timed: return 0
+        self.assertEqual(0x100 + 13 + struct.unpack_from("<b", wait, 12)[0], 0x110 + 5)  # jmp to tail
+        self.assertEqual(wake[5:10], bytes.fromhex("4531c0ff25"))       # tail: xor r8d; jmp [GOT]
+        self.assertEqual(8 + 6 + struct.unpack_from("<i", wake, 10)[0], 6 + 0x1ff8)  # same GOT slot
+        self.assertIsNone(shims.umtx_stubs({0x100: (shims.UMTX_WAIT, old(0))}))  # no wake to share
+
+    def test_umtx_cave(self):
+        old = lambda got_disp: (b"\xff\x25" + struct.pack("<i", got_disp)).ljust(16, b"\x90")
+        built = shims.umtx_cave({0x100: (shims.UMTX_WAIT, old(0x2000)),
+                                 0x110: (shims.UMTX_WAIT_UINT, old(0x1ff8)),
+                                 0x120: (shims.UMTX_WAKE, old(0x1ff0))}, 0x800)
+        out, cave = built
+        wait, wuint, wake = out[0x100], out[0x110], out[0x120]
+        self.assertEqual(wait[:5], b"\xb8" + struct.pack("<I", shims.UMTX_WAIT))     # mov eax, op
+        self.assertEqual(wuint[:5], b"\xb8" + struct.pack("<I", shims.UMTX_WAIT_UINT))
+        for va, stub in ((0x100, wait), (0x110, wuint)):                # jmp cave, 5 bytes in
+            self.assertEqual(va + 10 + struct.unpack_from("<i", stub, 6)[0], 0x800)
+        self.assertEqual(wake, shims.umtx_stub(old(0x1ff0), shims.UMTX_WAKE))
+        # the trampoline: test rdx,rdx; jne/jmp/jbe land on instruction boundaries, the call
+        # goes through the first wait stub's GOT slot, and the epilogue unwinds 5 pushes
+        self.assertEqual(cave[:3], bytes.fromhex("4885d2"))
+        self.assertEqual(cave[3:5], b"\x75\x07")
+        self.assertEqual(cave[10:12], b"\xeb\x0f")
+        self.assertEqual(cave[20:22], b"\x76\x05")
+        self.assertEqual(len(cave), 65)
+        got = 0x120 + 6 + 0x1ff0  # the wake stub's GOT slot: duplicate-name JMP_SLOTs
+        self.assertEqual(cave[56:60], struct.pack("<i", got - (0x800 + 60)))
+        self.assertEqual(cave[60:65], b"\x48\x83\xc4\x28\xc3")
+        self.assertIsNone(shims.umtx_cave({0x120: (shims.UMTX_WAKE, old(0x1ff0))}, 0x800))
+
+    def test_prefixed_stub(self):
+        stub = b"\xff\x25" + struct.pack("<i", 0x1000)
+        pre = shims.ARG_FIXUPS["ZP4e7rlzOUk"]
+        new = shims.prefixed_stub(stub, pre)
         self.assertEqual(len(new), 16)
-        self.assertEqual(new[:5], bytes.fromhex("bf64000000"))  # mov edi, 100
-        # jmp [rip+X] now ends 5 bytes later, so it must still reach the same GOT slot
-        self.assertEqual(5 + 6 + struct.unpack_from("<i", new, 7)[0], 6 + 0x1000)
+        self.assertEqual(new[:len(pre)], pre)
+        self.assertEqual(len(pre) + 6 + struct.unpack_from("<i", new, len(pre) + 2)[0], 6 + 0x1000)
+        self.assertIsNone(shims.prefixed_stub(b"\xe9" + bytes(5), pre))   # not jmp [GOT]
+        self.assertIsNone(shims.prefixed_stub(stub, bytes(11)))           # no room for the jmp
 
     def test_find_size_store(self):
         code = bytes.fromhex("90" * 10 + "48c745b030000000" + "488d75b0")
         self.assertEqual(shims.find_size_store(code, 0x30), 14)
+        # mov qword [rsi], 0x30: the opcode sits right before the ModRM byte and the imm32
+        self.assertEqual(shims.find_size_store(bytes.fromhex("48c70630000000"), 0x30), 3)
         self.assertIsNone(shims.find_size_store(bytes.fromhex("b830000000"), 0x30))  # mov eax, not a store
 
 
@@ -185,13 +237,38 @@ class TestPatchModule(unittest.TestCase):
         e = Elf(out)
         t = TEXT_OFF
         self.assertEqual(out[t + 0x90:t + 0x93], shims.RET0)                       # missing -> return 0
-        self.assertEqual(out[t + 0xA0:t + 0xA5], bytes.fromhex("bf64000000"))      # wait -> sleep
+        # wait -> mov eax, UMTX_WAIT; jmp the trampoline grown onto the segment's end
+        self.assertEqual(out[t + 0xA0:t + 0xA5], b"\xb8" + struct.pack("<I", shims.UMTX_WAIT))
+        cave_va = TEXT_VA + TEXT_SZ
+        self.assertEqual(0xA0 + 10 + struct.unpack_from("<i", out, t + 0xA6)[0], cave_va)
+        self.assertEqual(out[t + TEXT_SZ:t + TEXT_SZ + 3], bytes.fromhex("4885d2"))  # the trampoline
+        self.assertTrue(any("trampoline" in line for line in log))
         self.assertEqual(out[t + 0x80:t + 0x82], b"\xff\x25")                       # exported: untouched
         self.assertEqual(out[t + 0x14:t + 0x18], struct.pack("<I", 0x28))           # struct size fixed
-        self.assertIn((shims.USLEEP, "libkernel"), e.imports())                     # renamed, lib A
+        self.assertIn((shims.UMTX_OP, "libkernel"), e.imports())                    # renamed, lib A
         self.assertNotIn(("Hc4CaR6JBL0", "libkernel"), e.imports())
         self.assertEqual([b.sdk_version for b in selflib.find_param_blocks(bytes(data))], [0x04000031])
         self.assertTrue(any("unused" in line and "yyyyyyyyyyy" in line for line in log))
+
+    def test_arg_fixup(self):
+        # an exported import listed in ARG_FIXUPS gets the prefix in its PLT stub
+        flat, raw = build_module()
+        pre = bytes.fromhex("48c7471800000000")
+        saved = shims.ARG_FIXUPS
+        shims.ARG_FIXUPS = {"-sD02mFDBh4": pre}
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                ex = os.path.join(tmp, "exports.tsv")
+                write_exports(ex)
+                data = bytearray(raw)
+                log, _ = backport.patch_module(data, backport.load_exports(ex), set(), 0x04000031, None)
+        finally:
+            shims.ARG_FIXUPS = saved
+        out = bytes(selflib.rebuild_flat_elf(bytes(data)))
+        t = TEXT_OFF + PLT["presets"]
+        self.assertEqual(out[t:t + 8], pre)
+        self.assertEqual(PLT["presets"] + 14 + struct.unpack_from("<i", out, t + 10)[0], GOT["presets"])
+        self.assertTrue(any(line.lstrip().startswith("fixup   -sD02mFDBh4") for line in log))
 
     def test_cli_on_folder(self):
         _, raw = build_module()
@@ -228,7 +305,7 @@ class TestDiff(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("param   proc", r.stdout)
         self.assertIn("plt     0x90 zzzzzzzzzzz", r.stdout)
-        self.assertIn("import  Hc4CaR6JBL0#D#A -> 1jfXLRVzisc#A#A", r.stdout)
+        self.assertIn("import  Hc4CaR6JBL0#D#A -> 04AjkP0jO9U#A#A", r.stdout)
         self.assertIn("code    0x14", r.stdout)
 
 

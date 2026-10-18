@@ -12,10 +12,11 @@ firmware's own system libraries.
 For eboot.bin and every .prx/.sprx (sce_sys/ is skipped, it's Sony-signed):
 1. Lower the module/proc param SDK version to --sdk if it is higher. The loader refuses
    modules built for a newer SDK than the firmware.
-2. Lower known struct sizes the older function rejects (shims.STRUCT_SIZES).
+2. Lower known struct sizes the older function rejects (shims.STRUCT_SIZES), and fix up
+   arguments an exported function's older version rejects in its PLT stub (shims.ARG_FIXUPS).
 3. List imports the target firmware doesn't export. Modules the game ships itself are skipped.
    Each missing import that has a PLT stub gets a stand-in: an older NID of the same function
-   (RENAMES), a 100 us sleep for futex waits (SLEEP_WAITS), a known shim (KNOWN), or else
+   (RENAMES), FreeBSD's _umtx_op for futex waits/wakes (UMTX_SHIMS), a known shim (KNOWN), or else
    `return 0`. Imports with no PLT stub are never called and are left alone.
 Results go to WORK/overlay/ (same paths as app0) and WORK/report.txt, which names every
 stubbed function: a `return 0` is a guess, so that list is where to look when something breaks.
@@ -98,6 +99,47 @@ def collect(source, orig, only):
     return files
 
 
+def exec_cave_va(data, e, size):
+    """Vaddr where grow_exec_segment can put a trampoline: the end of the executable
+    segment, which stays inside the segment's last (already mapped) page. None if that page
+    has no room or the segment/entry layout is unusual."""
+    hdr, ents, _, phs = selflib.parse_self_header(bytes(data))
+    ex = [i for i, p in enumerate(phs) if p.p_type == 1 and p.p_flags & 1]
+    if len(ex) != 1 or sum(1 for t in ents if t.is_elf_segment and t.elf_ph_index == ex[0]) != 1:
+        return None
+    p = phs[ex[0]]
+    page_end = (p.p_vaddr + p.p_filesz + p.p_align - 1) & ~(p.p_align - 1)
+    if p.p_filesz != p.p_memsz or p.p_vaddr + p.p_filesz + size > page_end:
+        return None
+    return p.p_vaddr + p.p_filesz
+
+
+def grow_exec_segment(data, extra):
+    """Append `extra` to the executable segment, at the vaddr exec_cave_va returned (call
+    this after every PLT stub patch is already in `data`). A fake-signed SELF stores its
+    segments as plain blobs: the whole patched segment moves to the end of the file with
+    `extra` as its new tail, and the segment entry plus the embedded program header
+    (p_filesz, p_memsz) grow to cover it. Nothing moves in memory: the extra bytes stay
+    inside the segment's last page."""
+    hdr, ents, elf_off, phs = selflib.parse_self_header(bytes(data))
+    ex = [i for i, p in enumerate(phs) if p.p_type == 1 and p.p_flags & 1]
+    k = [j for j, t in enumerate(ents) if t.is_elf_segment and t.elf_ph_index == ex[0]]
+    if len(ex) != 1 or len(k) != 1:
+        return False
+    i, j = ex[0], k[0]
+    ent, p = ents[j], phs[i]
+    at = (len(data) + 0xF) & ~0xF
+    data.extend(b"\x00" * (at + ent.filesz + len(extra) - len(data)))
+    data[at:at + ent.filesz] = data[ent.offset:ent.offset + ent.filesz]
+    data[at + ent.filesz:at + ent.filesz + len(extra)] = extra
+    struct.pack_into("<QQQ", data, 0x20 + j * 0x20 + 8, at, ent.filesz + len(extra),
+                     ent.memsz + len(extra))
+    ph_at = elf_off + struct.unpack_from("<Q", data, elf_off + 0x20)[0] + i * 56
+    struct.pack_into("<QQ", data, ph_at + 32, p.p_filesz + len(extra), p.p_memsz + len(extra))
+    struct.pack_into("<Q", data, 0x10, len(data))
+    return True
+
+
 def patch_module(data, exports, shipped, sdk, names_db):
     """Patch one fake-signed SELF in place. Returns (log lines, missing NIDs)."""
     orig = bytes(data)
@@ -134,8 +176,30 @@ def patch_module(data, exports, shipped, sdk, names_db):
     unknown = sorted({m for _, m in e.imports() if m not in shipped and m not in exports})
     if unknown:
         log.append(f"  ?? modules not in the exports table, not checked: {', '.join(unknown)}")
+    for nid, pre in sorted(shims.ARG_FIXUPS.items()):
+        if nid in missing or nid not in by_nid:
+            continue
+        off = e.v2o(by_nid[nid])
+        stub = shims.prefixed_stub(elf_b[off:off + 6], pre)
+        if stub and shims.put(data, orig, elf_b, off, stub):
+            log.append(f"  fixup   {nid} (PLT {by_nid[nid]:#x}, {ncalls.get(nid, 0)} direct calls): "
+                       f"{pre.hex()} before the call")
+        else:
+            log.append(f"  ?? {nid}: argument fixup not applied (PLT stub not patchable)")
     names = load_names(names_db, missing)
     libs = e.import_libs()
+    # futex stand-ins: a shared trampoline appended to the exec segment gives every wait a
+    # real kernel timeout (shims.umtx_cave); the paired-stub layout is the fallback
+    umtx, cave = {}, None
+    if "libkernel" in libs:
+        stubs = {by_nid[n]: (shims.UMTX_SHIMS[n], elf_b[e.v2o(by_nid[n]):e.v2o(by_nid[n]) + 16])
+                 for n in missing if n in shims.UMTX_SHIMS and n in by_nid}
+        cave = exec_cave_va(data, e, len(shims.umtx_cave(stubs, 0)[1])) \
+            if any(op != shims.UMTX_WAKE for op, _ in stubs.values()) else None
+        if cave is not None:
+            umtx = shims.umtx_cave(stubs, cave)[0]
+        else:
+            umtx = shims.umtx_stubs(stubs) or {}
     for nid in sorted(missing):
         label = f"{nid} {names.get(nid, '(unnamed)')}"
         if nid in shims.RENAMES and shims.rename_import(data, nid, shims.RENAMES[nid]) == 1:
@@ -146,17 +210,29 @@ def patch_module(data, exports, shipped, sdk, names_db):
             continue
         off = e.v2o(by_nid[nid])
         where = f"(PLT {by_nid[nid]:#x}, {ncalls.get(nid, 0)} direct calls)"
-        if nid in shims.SLEEP_WAITS and "libkernel" in libs:
-            stub = shims.sleep_stub(elf_b[off:off + 6])
-            if shims.rename_import(data, nid, shims.USLEEP, libs["libkernel"]) == 1 and \
+        if nid in shims.UMTX_SHIMS and "libkernel" in libs:
+            stub = umtx.get(by_nid[nid]) or shims.umtx_stub(elf_b[off:off + 6], shims.UMTX_SHIMS[nid])
+            if stub and shims.rename_import(data, nid, shims.UMTX_OP, libs["libkernel"]) == 1 and \
                     shims.put(data, orig, elf_b, off, stub):
-                log.append(f"  usleep  {label} {where}")
+                if shims.UMTX_SHIMS[nid] == shims.UMTX_WAKE:
+                    kind = ""
+                elif cave:
+                    kind = ", trampoline wait"
+                else:
+                    kind = ", timed waits return at once" if by_nid[nid] in umtx else ", timeout dropped"
+                log.append(f"  umtx    {label} {where}{kind}")
                 continue
         new = shims.KNOWN.get(nid, shims.RET0).ljust(16, shims.PAD)
         if shims.put(data, orig, elf_b, off, new):
             log.append(f"  {'shim' if nid in shims.KNOWN else 'ret 0':7} {label} {where}")
         else:
             log.append(f"  !!      {label}: no unique spot in the SELF, NOT patched")
+    if cave is not None:
+        # the stubs are in; move the patched segment to the end of the file with the
+        # trampoline as its tail (exec_cave_va already checked this cannot fail)
+        assert grow_exec_segment(data, shims.umtx_cave(stubs, cave)[1])
+        log.append(f"  umtx trampoline at {cave:#x} (exec segment grown): "
+                   "timed waits sleep in the kernel, ~1 s recheck slices")
     return log, missing
 
 
