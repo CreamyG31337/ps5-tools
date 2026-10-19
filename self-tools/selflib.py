@@ -9,6 +9,9 @@ from dataclasses import dataclass
 from typing import BinaryIO, Dict, List, Optional, Tuple
 
 SELF_MAGIC = b"\x54\x14\xf5\xee"
+# Some PS5 dumps carry the PS4 SELF magic on an otherwise identical PS5 layout.
+PS4_SELF_MAGIC = b"\x4f\x15\x3d\x1d"
+SELF_MAGICS = (SELF_MAGIC, PS4_SELF_MAGIC)
 ELF_MAGIC = b"\x7fELF"
 
 MODULE_PARAM_MAGIC = struct.pack("<I", 0x3C13F4BF)
@@ -106,7 +109,7 @@ class SelfInfo:
 
 def is_self(data: bytes) -> bool:
     """Check if the given buffer begins with the SELF magic."""
-    return len(data) >= 4 and data[:4] == SELF_MAGIC
+    return len(data) >= 4 and data[:4] in SELF_MAGICS
 
 
 def parse_self_header(data: bytes) -> Tuple[SelfHeader, List[SelfSegmentEntry], int, List[ElfProgramHeader]]:
@@ -117,7 +120,7 @@ def parse_self_header(data: bytes) -> Tuple[SelfHeader, List[SelfSegmentEntry], 
     """
     if len(data) < 0x20:
         raise ValueError("Buffer too small for SELF header")
-    if data[:4] != SELF_MAGIC:
+    if data[:4] not in SELF_MAGICS:
         raise ValueError(f"Invalid SELF magic: {data[:4].hex()}")
 
     version = struct.unpack_from("<I", data, 0x04)[0]
@@ -179,7 +182,7 @@ def read_self_header_from_stream(
     h_bytes = stream.read(0x20)
     if len(h_bytes) < 0x20:
         raise ValueError("File too small for SELF header")
-    if h_bytes[:4] != SELF_MAGIC:
+    if h_bytes[:4] not in SELF_MAGICS:
         raise ValueError(f"Invalid SELF magic: {h_bytes[:4].hex()}")
 
     version = struct.unpack_from("<I", h_bytes, 0x04)[0]

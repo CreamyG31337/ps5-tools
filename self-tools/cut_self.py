@@ -11,7 +11,7 @@ import os
 import struct
 import sys
 
-from selflib import SELF_MAGIC
+from selflib import SELF_MAGIC, SELF_MAGICS
 
 
 def parse_hex_or_int(val: str) -> int:
@@ -74,7 +74,7 @@ def main() -> int:
                 print(f"Error: unexpected EOF reading header at offset {args.offset:#x}.", file=sys.stderr)
                 return 1
 
-            if hdr[:4] != SELF_MAGIC:
+            if hdr[:4] not in SELF_MAGICS:
                 print(
                     f"Error: invalid SELF magic at offset {args.offset:#x}: expected {SELF_MAGIC.hex()}, got {hdr[:4].hex()}.",
                     file=sys.stderr,

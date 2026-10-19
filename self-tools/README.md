@@ -9,7 +9,7 @@ Written in standard Python 3.9+ with zero external dependencies.
 ## Important Limitation
 
 > [!IMPORTANT]
-> These tools operate exclusively on **fake-signed, decrypted, or plaintext SELF binaries** (magic `54 14 F5 EE`). Standard retail encrypted SELFs require console hardware keys and must be decrypted before these tools can process them.
+> These tools operate exclusively on **fake-signed, decrypted, or plaintext SELF binaries** (magic `54 14 F5 EE`; some dumps carry the PS4 magic `4F 15 3D 1D` on the same PS5 layout, which is accepted too). Standard retail encrypted SELFs require console hardware keys and must be decrypted before these tools can process them.
 
 ---
 

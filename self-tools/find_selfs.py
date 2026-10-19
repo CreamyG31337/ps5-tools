@@ -12,7 +12,7 @@ import struct
 import sys
 from typing import Optional
 
-from selflib import MODULE_PARAM_MAGIC, PROC_PARAM_MAGIC, SELF_MAGIC, find_param_blocks
+from selflib import MODULE_PARAM_MAGIC, PROC_PARAM_MAGIC, SELF_MAGICS, find_param_blocks
 
 
 def parse_hex_or_int(val: str) -> int:
@@ -89,7 +89,7 @@ def main() -> int:
                 if len(header) < 0x20:
                     break
 
-                if header[:4] == SELF_MAGIC:
+                if header[:4] in SELF_MAGICS:
                     self_size = struct.unpack_from("<Q", header, 0x10)[0]
                     if self_size == 0 or pos + self_size > file_size:
                         pos += align

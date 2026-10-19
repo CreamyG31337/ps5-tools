@@ -138,6 +138,15 @@ class TestSelfLib(unittest.TestCase):
         self.assertEqual(info.module_name, "sample_module")
         self.assertEqual(info.module_sdk, 0x05000033)
         self.assertEqual(info.proc_sdk, 0x05000033)
+
+    def test_ps4_magic_same_layout(self):
+        """A PS5 SELF carrying the PS4 magic parses the same and keeps its magic when patched."""
+        ps4 = selflib.PS4_SELF_MAGIC + self.synthetic_self[4:]
+        self.assertTrue(selflib.is_self(ps4))
+        info = selflib.parse_self_info(ps4)
+        self.assertEqual(info.module_name, "sample_module")
+        self.assertEqual(selflib.rebuild_flat_elf(ps4), selflib.rebuild_flat_elf(self.synthetic_self))
+        self.assertFalse(selflib.is_self(b"\x00\x00\x00\x00" + self.synthetic_self[4:]))
         self.assertEqual(len(info.param_blocks), 2)
 
         types = {b.block_type for b in info.param_blocks}
