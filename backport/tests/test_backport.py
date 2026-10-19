@@ -41,6 +41,7 @@ def build_module():
         return o
 
     s_mod = {n: add(n) for n in ("libkernel", "libSceUserService", "libFoo")}
+    s_foo_file = add("libFoo.sprx")
     s_sync = add("libkernel_sync_on_address")
     s_self = add("sample")
     syms = ["-sD02mFDBh4#B#B", "zzzzzzzzzzz#C#C", "Hc4CaR6JBL0#D#A", "yyyyyyyyyyy#C#C"]
@@ -59,6 +60,8 @@ def build_module():
     tags = [(5, DYNS_VA), (10, len(strtab)), (6, DYNS_VA + sym_at), (0x6100003F, len(symtab)),
             (0x17, DYNS_VA + rel_at), (2, len(jmprel)), (0x61000043, s_self)]
     for i, n in enumerate(("libkernel", "libSceUserService", "libFoo")):
+        if n == "libFoo":
+            tags.append((1, s_foo_file))
         tags.append((0x61000045, (i << 48) | s_mod[n]))
         tags.append((0x61000049, (i << 48) | s_mod[n]))
     tags.append((0x61000049, (3 << 48) | s_sync))
@@ -269,6 +272,87 @@ class TestPatchModule(unittest.TestCase):
         self.assertEqual(out[t:t + 8], pre)
         self.assertEqual(PLT["presets"] + 14 + struct.unpack_from("<i", out, t + 10)[0], GOT["presets"])
         self.assertTrue(any(line.lstrip().startswith("fixup   -sD02mFDBh4") for line in log))
+
+    def test_arg_fixup_on_renamed_import(self):
+        # a missing import that RENAMES maps to an older NID still gets its ARG_FIXUPS prefix
+        flat, raw = build_module()
+        pre = bytes.fromhex("31c9")
+        saved = shims.ARG_FIXUPS, shims.RENAMES
+        shims.ARG_FIXUPS, shims.RENAMES = {"zzzzzzzzzzz": pre}, {"zzzzzzzzzzz": "xxxxxxxxxxx"}
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                ex = os.path.join(tmp, "exports.tsv")
+                write_exports(ex)
+                data = bytearray(raw)
+                log, _ = backport.patch_module(data, backport.load_exports(ex), set(), 0x04000031, None)
+        finally:
+            shims.ARG_FIXUPS, shims.RENAMES = saved
+        out = bytes(selflib.rebuild_flat_elf(bytes(data)))
+        t = TEXT_OFF + PLT["missing"]
+        self.assertEqual(out[t:t + 2], pre)
+        self.assertEqual(PLT["missing"] + 8 + struct.unpack_from("<i", out, t + 4)[0], GOT["missing"])
+        self.assertIn(("xxxxxxxxxxx", "libFoo"), Elf(out).imports())
+        self.assertTrue(any(line.lstrip().startswith("renamed zzzzzzzzzzz") for line in log))
+
+    def test_absent_lib(self):
+        _, raw = build_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            ex = os.path.join(tmp, "exports.tsv")
+            write_exports(ex)
+            exports = backport.load_exports(ex)
+        del exports["libFoo"]  # simulate target firmware lacking libFoo entirely
+        data = bytearray(raw)
+        log, missing = backport.patch_module(data, exports, set(), 0x04000031, None,
+                                             absent={"libFoo": "libB"})
+        self.assertIn("zzzzzzzzzzz", missing)
+        self.assertFalse(any("??" in line and "libFoo" in line for line in log))
+        self.assertIn("  absent  libFoo -> libB (1 imports stubbed)", log)
+        self.assertTrue(any(line.lstrip().startswith("ret 0   zzzzzzzzzzz") for line in log))
+        out = bytes(selflib.rebuild_flat_elf(bytes(data)))
+        e = Elf(out)
+        self.assertEqual(out[TEXT_OFF + 0x90:TEXT_OFF + 0x93], shims.RET0)
+        self.assertEqual(e.modules()[2], "libB")
+        self.assertEqual(e.module_files()["libB"], "libB.sprx")
+        self.assertIn(("zzzzzzzzzzz", "libB"), e.imports())
+
+    def test_absent_lib_too_long_errors(self):
+        _, raw = build_module()
+        with self.assertRaises(ValueError):
+            backport.patch_module(bytearray(raw), {}, set(), 0x04000031, None,
+                                  absent={"libFoo": "libFooTooLong"})
+
+    def test_byte_patch_and_error(self):
+        _, raw = build_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            ex = os.path.join(tmp, "exports.tsv")
+            write_exports(ex)
+            exports = backport.load_exports(ex)
+        data = bytearray(raw)
+        # at vaddr 0x10 is c744240830000000; patch first two bytes c744 -> 6690
+        log, _ = backport.patch_module(data, exports, set(), 0x04000031, None,
+                                       patches=[(0x10, "c744", "6690")])
+        out = bytes(selflib.rebuild_flat_elf(bytes(data)))
+        self.assertEqual(out[TEXT_OFF + 0x10:TEXT_OFF + 0x12], bytes.fromhex("6690"))
+        self.assertIn("  patch   0x10 c744 -> 6690", log)
+        # re-applying the same patch reports `already`
+        log2, _ = backport.patch_module(data, exports, set(), 0x04000031, None,
+                                        patches=[(0x10, "c744", "6690")])
+        self.assertTrue(any("already" in line and "0x10" in line for line in log2))
+        # wrong OLDHEX errors
+        with self.assertRaises(ValueError):
+            backport.patch_module(bytearray(raw), exports, set(), 0x04000031, None,
+                                  patches=[(0x10, "dead", "6690")])
+
+    def test_patch_file_parsing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pf = os.path.join(tmp, "patches.txt")
+            with open(pf, "w", encoding="utf-8") as f:
+                f.write("# comment line\n\n"
+                        "eboot.bin:10:c744:6690  # inline comment\n"
+                        "sub/mod.prx:0x20:9090:c390\n")
+            parsed = backport.load_patches(["eboot.bin:0x18:e8:90"], [pf])
+        self.assertEqual(parsed["eboot.bin"], [(0x18, b"\xe8", b"\x90"), (0x10, b"\xc7\x44", b"\x66\x90")])
+        self.assertEqual(parsed["sub/mod.prx"], [(0x20, b"\x90\x90", b"\xc3\x90")])
 
     def test_cli_on_folder(self):
         _, raw = build_module()

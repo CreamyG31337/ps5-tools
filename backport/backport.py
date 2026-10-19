@@ -3,6 +3,8 @@ to an overlay folder.
 
     python backport.py SOURCE --exports exports.tsv --out WORK [--sdk 0x04000031]
                        [--nids nids.csv] [--replace INNER=LOCAL ...] [--only REGEX]
+                       [--absent-lib NAME=SUBSTITUTE ...] [--provided-lib NAME ...]
+                       [--patch INNER:VADDR:OLDHEX:NEWHEX ...] [--patch-file FILE ...]
 
 SOURCE is either an app0 folder dump (eboot.bin, sce_module/, ...) or a fake package .pkg.
 A .pkg is read with ProsperoPkgTool (see pkgtool/README.md), which also decodes
@@ -20,7 +22,12 @@ For eboot.bin and every .prx/.sprx (sce_sys/ is skipped, it's Sony-signed):
    `return 0`. Imports with no PLT stub are never called and are left alone.
 Results go to WORK/overlay/ (same paths as app0) and WORK/report.txt, which names every
 stubbed function: a `return 0` is a guess, so that list is where to look when something breaks.
---replace INNER=LOCAL copies a hand-made file into the overlay instead.
+--absent-lib NAME=SUBSTITUTE stubs every called import of a library the target firmware lacks
+entirely and points the module's dependency on NAME at SUBSTITUTE in place. --provided-lib NAME
+treats NAME like a module the game ships: use it when a newer build of a system library goes
+into the game's fakelib/ (e.g. libSceAgc), so its imports get no stand-ins. --patch (or
+--patch-file) applies per-module byte changes at flat-ELF virtual addresses. --replace
+INNER=LOCAL copies a hand-made file into the overlay instead.
 
 The overlay is what a backport loader (e.g. ShadowMountPlus's backports folder) lays over the
 installed game. Input files must be fake-signed SELFs (fpkg/dump), not retail-encrypted ones.
@@ -46,6 +53,10 @@ SKIP = re.compile(r"^sce_sys/", re.I)
 PPT = os.path.join(HERE, "pkgtool", "ppt.ps1")
 
 
+class PatchError(ValueError):
+    pass
+
+
 def load_exports(path):
     """module name -> set of exported NIDs."""
     out = {}
@@ -63,6 +74,95 @@ def load_names(path, nids):
                 if r["nid"] in nids:
                     names[r["nid"]] = r["name"]
     return names
+
+
+def parse_absent(specs):
+    """Parse ['NAME=SUBSTITUTE', ...] or {NAME: SUBSTITUTE} -> {NAME: SUBSTITUTE}."""
+    items = specs.items() if isinstance(specs, dict) else (
+        s.split("=", 1) if "=" in s else (s, "") for s in (specs or ())
+    )
+    out = {}
+    for name, sub in items:
+        if not name or not sub:
+            raise PatchError(f"invalid --absent-lib {name}={sub}: expected NAME=SUBSTITUTE")
+        if len(sub) > len(name):
+            raise PatchError(f"absent-lib {name}={sub}: substitute {sub!r} is longer than {name!r}")
+        out[name] = sub
+    return out
+
+
+def parse_patch_spec(spec):
+    """Parse 'INNER:VADDR:OLDHEX:NEWHEX' -> (inner, vaddr, old_bytes, new_bytes)."""
+    parts = spec.strip().rsplit(":", 3)
+    if len(parts) != 4 or not parts[0]:
+        raise PatchError(f"invalid patch spec {spec!r}: expected INNER:VADDR:OLDHEX:NEWHEX")
+    inner, va_s, old_s, new_s = parts
+    try:
+        va = int(va_s, 16)
+        old = bytes.fromhex(old_s)
+        new = bytes.fromhex(new_s)
+    except ValueError as ex:
+        raise PatchError(f"invalid patch spec {spec!r}: {ex}") from ex
+    if not old or len(old) != len(new):
+        raise PatchError(f"invalid patch spec {spec!r}: old and new hex must have equal non-zero length")
+    return inner.replace("\\", "/"), va, old, new
+
+
+def load_patches(specs=(), files=()):
+    """Parse --patch specs and --patch-file files -> {inner: [(vaddr, old_bytes, new_bytes), ...]}."""
+    out = {}
+    all_specs = list(specs or ())
+    for path in files or ():
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                s = line.split("#", 1)[0].strip()
+                if s:
+                    all_specs.append(s)
+    for s in all_specs:
+        inner, va, old, new = parse_patch_spec(s)
+        out.setdefault(inner, []).append((va, old, new))
+    return out
+
+
+def rewrite_absent_lib(data, orig, elf_b, e, name, sub):
+    """Rewrite the dynamic string table entries that name `name` as a needed module to `sub`."""
+    so = e.v2o(e.T[5])
+    rewrites = {}
+    # if the module already needs `sub`, reuse that file name (e.g. libSceAjm.native.prx), so
+    # the loader doesn't pull in a second build of the same library
+    sub_fn, last_needed = None, None
+    for t, v in e.tags:
+        if t == 1:
+            last_needed = v
+        elif t == 0x61000045:
+            if e.s(v & 0xFFFFFFFF) == sub and last_needed is not None:
+                sub_fn = e.s(last_needed)
+            last_needed = None
+    last_needed = None
+    for t, v in e.tags:
+        if t == 1:
+            last_needed = v
+        elif t == 0x61000045:
+            off = v & 0xFFFFFFFF
+            if e.s(off) == name:
+                rewrites[off] = (name, sub)
+                if last_needed is not None:
+                    old_fn = e.s(last_needed)
+                    new_fn = sub_fn if sub_fn and len(sub_fn) <= len(old_fn) else \
+                        sub + os.path.splitext(old_fn)[1]
+                    rewrites[last_needed] = (old_fn, new_fn)
+            last_needed = None
+        elif t == 0x61000049 and e.s(v & 0xFFFFFFFF) == name:
+            rewrites[v & 0xFFFFFFFF] = (name, sub)
+    if not rewrites:
+        raise PatchError(f"absent-lib {name}: needed module entry not found")
+    for off, (old_s, new_s) in rewrites.items():
+        if len(new_s) > len(old_s):
+            raise PatchError(f"absent-lib {name}={sub}: {new_s!r} is longer than {old_s!r}")
+        raw_hits = len(re.findall(re.escape(b"\x00" + old_s.encode("latin1") + b"\x00"), orig))
+        padded = new_s.encode("latin1").ljust(len(old_s), b"\x00")
+        if raw_hits != 1 or not shims.put(data, orig, elf_b, so + off, padded):
+            raise PatchError(f"absent-lib {name}: string {old_s!r} not uniquely patchable in SELF")
 
 
 def ppt(*args):
@@ -140,8 +240,9 @@ def grow_exec_segment(data, extra):
     return True
 
 
-def patch_module(data, exports, shipped, sdk, names_db):
+def patch_module(data, exports, shipped, sdk, names_db, absent=None, patches=()):
     """Patch one fake-signed SELF in place. Returns (log lines, missing NIDs)."""
+    absent = parse_absent(absent)
     orig = bytes(data)
     elf_b = bytes(selflib.rebuild_flat_elf(orig))
     e = Elf(elf_b)
@@ -169,15 +270,27 @@ def patch_module(data, exports, shipped, sdk, names_db):
             elif shims.put(data, orig, elf_b, off - 64 + at, struct.pack("<I", new)):
                 log.append(f"  struct  {nid} call at {site:#x}: size {old:#x} -> {new:#x}")
 
+    imps = e.imports()
     missing = set()
-    for nid, mod in e.imports():
-        if mod not in shipped and mod in exports and nid not in exports[mod]:
-            missing.add(nid)
-    unknown = sorted({m for _, m in e.imports() if m not in shipped and m not in exports})
+    absent_nids = set()
+    for nid, mod in imps:
+        if mod not in shipped:
+            if mod in absent:
+                missing.add(nid)
+                absent_nids.add(nid)
+            elif mod in exports and nid not in exports[mod]:
+                missing.add(nid)
+    unknown = sorted({m for _, m in imps if m not in shipped and m not in exports and m not in absent})
     if unknown:
         log.append(f"  ?? modules not in the exports table, not checked: {', '.join(unknown)}")
+    present_mods = set(e.modules().values()) | {m for _, m in imps}
+    for mod in sorted(m for m in absent if m not in shipped and m in present_mods):
+        rewrite_absent_lib(data, orig, elf_b, e, mod, absent[mod])
+        k = sum(1 for n, m in imps if m == mod and n in by_nid)
+        log.append(f"  absent  {mod} -> {absent[mod]} ({k} imports stubbed)")
     for nid, pre in sorted(shims.ARG_FIXUPS.items()):
-        if nid in missing or nid not in by_nid:
+        renamed = nid in shims.RENAMES and nid not in absent_nids
+        if (nid in missing and not renamed) or nid not in by_nid:
             continue
         off = e.v2o(by_nid[nid])
         stub = shims.prefixed_stub(elf_b[off:off + 6], pre)
@@ -193,7 +306,7 @@ def patch_module(data, exports, shipped, sdk, names_db):
     umtx, cave = {}, None
     if "libkernel" in libs:
         stubs = {by_nid[n]: (shims.UMTX_SHIMS[n], elf_b[e.v2o(by_nid[n]):e.v2o(by_nid[n]) + 16])
-                 for n in missing if n in shims.UMTX_SHIMS and n in by_nid}
+                 for n in missing if n in shims.UMTX_SHIMS and n not in absent_nids and n in by_nid}
         cave = exec_cave_va(data, e, len(shims.umtx_cave(stubs, 0)[1])) \
             if any(op != shims.UMTX_WAKE for op, _ in stubs.values()) else None
         if cave is not None:
@@ -202,7 +315,8 @@ def patch_module(data, exports, shipped, sdk, names_db):
             umtx = shims.umtx_stubs(stubs) or {}
     for nid in sorted(missing):
         label = f"{nid} {names.get(nid, '(unnamed)')}"
-        if nid in shims.RENAMES and shims.rename_import(data, nid, shims.RENAMES[nid]) == 1:
+        if nid not in absent_nids and nid in shims.RENAMES and \
+                shims.rename_import(data, nid, shims.RENAMES[nid]) == 1:
             log.append(f"  renamed {label} -> {shims.RENAMES[nid]}")
             continue
         if nid not in by_nid:
@@ -210,7 +324,7 @@ def patch_module(data, exports, shipped, sdk, names_db):
             continue
         off = e.v2o(by_nid[nid])
         where = f"(PLT {by_nid[nid]:#x}, {ncalls.get(nid, 0)} direct calls)"
-        if nid in shims.UMTX_SHIMS and "libkernel" in libs:
+        if nid not in absent_nids and nid in shims.UMTX_SHIMS and "libkernel" in libs:
             stub = umtx.get(by_nid[nid]) or shims.umtx_stub(elf_b[off:off + 6], shims.UMTX_SHIMS[nid])
             if stub and shims.rename_import(data, nid, shims.UMTX_OP, libs["libkernel"]) == 1 and \
                     shims.put(data, orig, elf_b, off, stub):
@@ -227,6 +341,28 @@ def patch_module(data, exports, shipped, sdk, names_db):
             log.append(f"  {'shim' if nid in shims.KNOWN else 'ret 0':7} {label} {where}")
         else:
             log.append(f"  !!      {label}: no unique spot in the SELF, NOT patched")
+    for item in patches or ():
+        if isinstance(item, str):
+            _, va, old, new = parse_patch_spec(item if item.count(":") >= 3 else f"_:{item}")
+        else:
+            va, old, new = item[-3:]
+            va = int(va, 16) if isinstance(va, str) else int(va)
+            old = bytes.fromhex(old) if isinstance(old, str) else bytes(old)
+            new = bytes.fromhex(new) if isinstance(new, str) else bytes(new)
+        if not old or len(old) != len(new):
+            raise PatchError(f"patch at {va:#x}: old and new hex must have equal non-zero length")
+        off = e.v2o(va)
+        if off is None or off + len(old) > len(elf_b):
+            raise PatchError(f"patch at {va:#x}: address not in a loadable segment")
+        cur = elf_b[off:off + len(old)]
+        if cur == new:
+            log.append(f"  already {va:#x} {old.hex()} -> {new.hex()}")
+        elif cur != old:
+            raise PatchError(f"patch at {va:#x}: expected {old.hex()}, found {cur.hex()}")
+        elif not shims.put(data, orig, elf_b, off, new):
+            raise PatchError(f"patch at {va:#x}: no unique spot in the SELF")
+        else:
+            log.append(f"  patch   {va:#x} {old.hex()} -> {new.hex()}")
     if cave is not None:
         # the stubs are in; move the patched segment to the end of the file with the
         # trampoline as its tail (exec_cave_va already checked this cannot fail)
@@ -246,7 +382,21 @@ def main():
     ap.add_argument("--nids", help="NID database CSV (nid,name) for readable reports")
     ap.add_argument("--replace", nargs="*", default=[], metavar="INNER=LOCAL")
     ap.add_argument("--only", help="regex on the inner path: only these modules")
+    ap.add_argument("--absent-lib", action="append", default=[], metavar="NAME=SUBSTITUTE",
+                    help="stub imports of absent library NAME and point its module dependency at SUBSTITUTE")
+    ap.add_argument("--provided-lib", action="append", default=[], metavar="NAME",
+                    help="library the game gets from elsewhere (e.g. a newer build in its fakelib/), so "
+                         "its imports aren't checked against the target firmware")
+    ap.add_argument("--patch", action="append", default=[], metavar="INNER:VADDR:OLDHEX:NEWHEX",
+                    help="patch bytes at flat-ELF hex VADDR in module INNER")
+    ap.add_argument("--patch-file", action="append", default=[], metavar="FILE",
+                    help="file of INNER:VADDR:OLDHEX:NEWHEX patch specs (# comments allowed)")
     a = ap.parse_args()
+    try:
+        absent = parse_absent(a.absent_lib)
+        patches = load_patches(a.patch, a.patch_file)
+    except PatchError as ex:
+        sys.exit(str(ex))
     exports = load_exports(a.exports)
     orig, overlay = os.path.join(a.out, "orig"), os.path.join(a.out, "overlay")
 
@@ -259,6 +409,7 @@ def main():
         except Exception:
             pass
     shipped.discard(None)
+    shipped |= set(a.provided_lib)
     replace = dict(r.split("=", 1) for r in a.replace)
     report, total = [f"game's own modules: {', '.join(sorted(shipped))}"], 0
     for i in sorted(set(inner) | set(replace)):
@@ -270,7 +421,10 @@ def main():
             continue
         data = bytearray(open(paths[i], "rb").read())
         try:
-            log, missing = patch_module(data, exports, shipped, a.sdk, a.nids)
+            log, missing = patch_module(data, exports, shipped, a.sdk, a.nids,
+                                        absent=absent, patches=patches.get(i, ()))
+        except PatchError as ex:
+            sys.exit(f"{i}: {ex}")
         except Exception as ex:  # e.g. retail-encrypted
             shutil.copyfile(paths[i], dst)
             report.append(f"== {i}: not patched, copied as-is ({type(ex).__name__}: {ex})")

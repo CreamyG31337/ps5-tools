@@ -25,12 +25,19 @@ KNOWN = {
 # Imports renamed to an older NID of the same function that the target does export. Same
 # library, and every NID is 11 characters, so the import string is patched in place.
 RENAMES = {
-    # sceAgc create-interpolant-mapping: emulators treat dbOl as an SDK alias of pdEV7bI6COI.
+    # sceAgc create-interpolant-mapping. Emulators treat dbOl as an SDK alias of pdEV7bI6COI, but a
+    # newer libSceAgc exports both as different functions. The rename was fine for an SDK 10 Unity
+    # game; an SDK 17 Unity (URP 2D) game rendered its scene magenta with it. Better: put a newer
+    # libSceAgc + libSceAgcDriver in the game's fakelib/ and pass --provided-lib for both.
     "dbOlWdppb4o": "pdEV7bI6COI",
     # newer sceAgcDcbSetIndexSize(dcb, size, cache, perInstanceObjectId): emits a 3-dword
     # index-type packet. Games seen so far pass 0 as the 4th argument, which the older
     # 3-argument GIIW2J37e70 matches. `return 0` here left the frame without its packet.
     "-KRzWekV120": "GIIW2J37e70",
+    # sceKernelMapNamedFlexibleMemoryInternal(&addr, len, prot, flags, name), used by newer libc's
+    # heap. Same arguments as sceKernelMapNamedFlexibleMemory; an SDK 5 libc calls that one at the
+    # same spots with flags = 0 (ARG_FIXUPS clears the newer 0x8000). `return 0` left addr NULL.
+    "4h6F1LLbTiw": "mL8NDH86iQI",
 }
 
 # libkernel_sync_on_address, a library FW 4.03 doesn't have (used by newer libc and Unity's
@@ -76,6 +83,9 @@ ARG_FIXUPS = {
     # 0x809F0000 before the save service is reached; without create bits it is never checked.
     #   mov qword [rdi+0x18], 0
     "ZP4e7rlzOUk": bytes.fromhex("48c7471800000000"),
+    # renamed sceKernelMapNamedFlexibleMemoryInternal (see RENAMES): flags = 0
+    #   xor ecx, ecx
+    "4h6F1LLbTiw": bytes.fromhex("31c9"),
 }
 
 
