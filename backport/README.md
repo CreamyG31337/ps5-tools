@@ -6,7 +6,7 @@ worked example.
 
 | Tool | What it does |
 |---|---|
-| `backport.py SOURCE --exports T --out W` | The pipeline: from an app0 folder or `.pkg` to an overlay folder plus a report. Lowers SDK versions, fixes known struct sizes, gives every called missing function a stand-in, redirects absent libraries (`--absent-lib`) and applies per-module byte patches (`--patch`, `--patch-file`) |
+| `backport.py SOURCE --exports T --out W` | The pipeline: from an app0 folder or `.pkg` to an overlay folder plus a report. Lowers SDK versions, fixes known struct sizes, gives every called missing function a stand-in, redirects absent libraries (`--absent-lib`) applies per-module byte patches (`--patch`, `--patch-file`), and can sanitize GPU command buffers older firmware rejects (`--pm4-sanitize`) |
 | `fw_exports.py LIBDIR --out T` | Builds the target firmware's export table from its decrypted system libraries |
 | `diff_backport.py ORIGINAL RELEASED` | Shows what someone else's backport changed by hand, labelled, so it can be turned into a rule |
 | `shims.py` | Every known fix (renames, shims, sleeps, struct sizes) and why. Add new ones here |
@@ -26,3 +26,5 @@ python -m unittest discover -s tests
 ```
 
 The tests build a small synthetic module in memory; no game or system files are needed.
+If the `unicorn` package is installed, one test also runs the `--pm4-sanitize` code on a fake
+command buffer; without it that test is skipped.

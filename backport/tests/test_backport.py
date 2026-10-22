@@ -7,6 +7,7 @@ No Sony or game data: the module below is assembled byte by byte. It imports
   yyyyyyyyyyy from libFoo (missing, never called: no PLT stub),
 and has a proc param with SDK 0x10000040.
 """
+import importlib.util
 import os
 import struct
 import subprocess
@@ -116,6 +117,10 @@ def build_module():
     return bytes(flat), bytes(raw)
 
 
+def self_flat_call(site, target):
+    return b"\xe8" + struct.pack("<i", target - (site + 5))
+
+
 def wr(path, data):
     with open(path, "wb") as f:
         f.write(data)
@@ -219,6 +224,75 @@ class TestShims(unittest.TestCase):
         self.assertIsNone(shims.prefixed_stub(b"\xe9" + bytes(5), pre))   # not jmp [GOT]
         self.assertIsNone(shims.prefixed_stub(stub, bytes(11)))           # no room for the jmp
 
+    def test_pm4_sanitizer_layout(self):
+        thunks, code = shims.pm4_sanitizer([0x80, 0x90], 0x1000)
+        self.assertEqual(thunks, {0x80: 0x1000, 0x90: 0x101A})
+        # thunk: six pushes, call the sanitizer, six pops, jmp to the PLT stub
+        self.assertEqual(code[:8], bytes.fromhex("5756525141504151"))
+        san = 0x1000 + 13 + struct.unpack_from("<i", code, 9)[0]
+        self.assertEqual(san, 0x1034)
+        self.assertEqual(code[13:21], bytes.fromhex("415941585 95a5e5f".replace(" ", "")))
+        self.assertEqual(0x1000 + 26 + struct.unpack_from("<i", code, 22)[0], 0x80)
+        self.assertEqual(code[-1:], b"\xc3")
+        # the sanitizer's own bytes don't depend on where it is placed
+        self.assertEqual(shims.pm4_sanitizer([0x80, 0x90], 0x7000)[1][52:], code[52:])
+
+    @unittest.skipUnless(importlib.util.find_spec("unicorn"), "needs unicorn to run the x86 code")
+    def test_pm4_sanitizer_runs(self):
+        from unicorn import Uc, UC_ARCH_X86, UC_MODE_64
+        from unicorn.x86_const import UC_X86_REG_RDI, UC_X86_REG_RSP
+        code_va, buf, seg2, tbl, desc, stack = 0x10000, 0x20000, 0x30000, 0x40000, 0x50000, 0x60000
+        _, code = shims.pm4_sanitizer([0x80], code_va)
+        san = code_va + 26  # after the one thunk
+        neg = 0xFFFFFFFF
+        tables = {
+            0: [(0x81, 1), (neg, neg)],            # trailing placeholder -> count 1
+            1: [(neg, neg)],                       # only a placeholder -> count 0, address 0
+            2: [(neg, neg), (0x10, 2), (0x11, 3)],  # leading -> compacted
+            3: [(0x20, 4)],                        # clean: untouched
+        }
+        mem = {}
+        for k, pairs in tables.items():
+            mem[k] = tbl + k * 0x100
+
+        def ld(k, op=0x63):
+            return struct.pack("<5I", 0xC0030000 | op << 8, mem[k] & neg, mem[k] >> 32, 0x80000000,
+                               len(tables[k]))
+        set_sh = struct.pack("<3I", 0xC0017600, 0x207, 5)               # unrelated packet
+        filler = struct.pack("<I", 0x80000000)                           # type-2
+        jump = struct.pack("<4I", 0xC0023F00, seg2, 0, 0x0F300000 | 10)  # CHAIN to segment 2
+        main = ld(0) + set_sh + filler + ld(1, 0x64) + jump
+        second = ld(2, 0x9F) + ld(3)
+        mu = Uc(UC_ARCH_X86, UC_MODE_64)
+        for base in (code_va, buf, seg2, tbl, desc, stack):
+            mu.mem_map(base, 0x10000)
+        mu.mem_write(code_va, code)
+        mu.mem_write(buf, main)
+        mu.mem_write(seg2, second)
+        for k, pairs in tables.items():
+            mu.mem_write(mem[k], b"".join(struct.pack("<II", o, v) for o, v in pairs))
+        mu.mem_write(desc, struct.pack("<QI", buf, len(main) // 4))
+        mu.mem_write(stack + 0x8000, struct.pack("<Q", 0xDEAD0000))     # return address
+        mu.reg_write(UC_X86_REG_RSP, stack + 0x8000)
+        mu.reg_write(UC_X86_REG_RDI, desc)
+        mu.mem_map(0xDEAD0000, 0x1000)
+        mu.emu_start(san, 0xDEAD0000, count=100000)
+
+        def pkt(at):
+            return struct.unpack("<5I", bytes(mu.mem_read(at, 20)))
+
+        def pairs(k, n):
+            return [struct.unpack_from("<II", bytes(mu.mem_read(mem[k], 8 * n)), 8 * i) for i in range(n)]
+        self.assertEqual(pkt(buf)[4], 1)
+        self.assertEqual(pairs(0, 1), [(0x81, 1)])
+        p1 = pkt(buf + len(ld(0) + set_sh + filler))
+        self.assertEqual((p1[1], p1[2], p1[4]), (0, 0, 0))
+        self.assertEqual(pkt(seg2)[4], 2)                                 # followed the CHAIN jump
+        self.assertEqual(pairs(2, 2), [(0x10, 2), (0x11, 3)])
+        self.assertEqual(pkt(seg2 + 20)[4], 1)
+        self.assertEqual(pairs(3, 1), [(0x20, 4)])
+        self.assertEqual(bytes(mu.mem_read(buf + 20, 12)), set_sh)        # other packets untouched
+
     def test_find_size_store(self):
         code = bytes.fromhex("90" * 10 + "48c745b030000000" + "488d75b0")
         self.assertEqual(shims.find_size_store(code, 0x30), 14)
@@ -320,6 +394,40 @@ class TestPatchModule(unittest.TestCase):
         with self.assertRaises(ValueError):
             backport.patch_module(bytearray(raw), {}, set(), 0x04000031, None,
                                   absent={"libFoo": "libFooTooLong"})
+
+    def test_pm4_sanitize(self):
+        # pretend the exported presets import is a submit function: its call goes to a thunk in
+        # the grown exec segment, after the umtx trampoline, and the PLT stub stays as it was
+        _, raw = build_module()
+        saved = shims.PM4_SUBMITS
+        shims.PM4_SUBMITS = {"-sD02mFDBh4": "sceAgcDriverSubmitDcb"}
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                ex = os.path.join(tmp, "exports.tsv")
+                write_exports(ex)
+                exports = backport.load_exports(ex)
+            data = bytearray(raw)
+            log, _ = backport.patch_module(data, exports, set(), 0x04000031, None, pm4=True)
+            plain = bytearray(raw)
+            backport.patch_module(plain, exports, set(), 0x04000031, None)
+        finally:
+            shims.PM4_SUBMITS = saved
+        out = bytes(selflib.rebuild_flat_elf(bytes(data)))
+        cave_va = TEXT_VA + TEXT_SZ
+        tramp = 65  # the umtx trampoline (test_umtx_cave)
+        pm4_va = (cave_va + tramp + 0xF) & ~0xF
+        site = 0x18
+        self.assertEqual(out[TEXT_OFF + site], 0xE8)
+        self.assertEqual(site + 5 + struct.unpack_from("<i", out, TEXT_OFF + site + 1)[0], pm4_va)
+        self.assertEqual(out[TEXT_OFF + TEXT_SZ:TEXT_OFF + TEXT_SZ + 3], bytes.fromhex("4885d2"))
+        self.assertEqual(out[TEXT_OFF + pm4_va:TEXT_OFF + pm4_va + 8], bytes.fromhex("5756525141504151"))
+        self.assertEqual(out[TEXT_OFF + 0x80:TEXT_OFF + 0x82], b"\xff\x25")
+        self.assertTrue(any(line.lstrip().startswith("pm4     call sceAgcDriverSubmitDcb at 0x18") for line in log))
+        self.assertTrue(any("pm4 sanitizer at" in line for line in log))
+        # without the flag nothing changes at the call
+        plain_out = bytes(selflib.rebuild_flat_elf(bytes(plain)))
+        self.assertEqual(plain_out[TEXT_OFF + site:TEXT_OFF + site + 5],
+                         self_flat_call(site, PLT["presets"]))
 
     def test_byte_patch_and_error(self):
         _, raw = build_module()

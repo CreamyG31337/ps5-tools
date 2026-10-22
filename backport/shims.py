@@ -238,3 +238,146 @@ def find_size_store(code, size):
     hits = [m.start() for m in re.finditer(re.escape(imm), code)
             if b"\xc7" in code[max(0, m.start() - 8):m.start() - 1]]
     return hits[-1] if hits else None
+
+
+# SDK 11+ engines can fill the {offset, value} tables of indirect register loads (PM4
+# LOAD_SH_REG_INDEX 0x63, LOAD_CONTEXT_REG_INDEX 0x64, and 0x9F) with a {0xFFFFFFFF, 0xFFFFFFFF}
+# "no register" placeholder. Newer CP firmware skips it. FW 4.03's writes it, to SH register
+# 0x2C00 + 0xFFFFFFFF, and the game dies with
+#   GPU Bad packet error:Privilege reg. vmid: game process, opcode:0xc00..... 0 0 0x2bff
+#   exception: 0xa0d0c006 (GPU_FAULT_BAD_COMMAND_ASYNC)
+# (the opcode named is just the last packet the CP parsed, and varies). Found on Crimson Desert
+# (SDK 11.00, BlackSpace engine), whose tables are written by inlined engine code, so the fix
+# goes at the choke point: with --pm4-sanitize, every direct call to these submit functions
+# goes through pm4_sanitizer's code first, which removes the placeholders from the command
+# buffer the descriptor names. Both functions take rdi = descriptor {u64 buffer, u32 dwords}.
+PM4_SUBMITS = {
+    "UglJIZjGssM": "sceAgcDriverSubmitDcb",
+    "AhGvpITrf4M": "sceAgcDriverAgrSubmitDcb",
+}
+
+
+def _asm(prog, base, ext):
+    """Two-pass assembler for pm4_sanitizer. Items are raw bytes, ("L", label), or
+    (opcode hex, label): "E8"/"E9" call/jmp rel32, or a short jcc/jmp that grows to rel32 when
+    the target is out of range. Returns (bytes, {label: vaddr})."""
+    long = set()
+
+    def size(k, it):
+        if it[0] in ("E8", "E9"):
+            return 5
+        if k in long:
+            return 5 if it[0] == "EB" else 6
+        return 2
+    while True:
+        labels, pc = dict(ext), base
+        for k, it in enumerate(prog):
+            if isinstance(it, bytes):
+                pc += len(it)
+            elif it[0] == "L":
+                labels[it[1]] = pc
+            else:
+                pc += size(k, it)
+        out, grew = bytearray(), False
+        for k, it in enumerate(prog):
+            if isinstance(it, bytes):
+                out += it
+                continue
+            if it[0] == "L":
+                continue
+            n = size(k, it)
+            rel = labels[it[1]] - (base + len(out) + n)
+            if it[0] in ("E8", "E9"):
+                out += bytes.fromhex(it[0]) + struct.pack("<i", rel)
+            elif n == 2 and -128 <= rel <= 127:
+                out += bytes.fromhex(it[0]) + struct.pack("<b", rel)
+            elif n == 2:
+                long.add(k)
+                grew = True
+                out += bytes(2)
+            elif it[0] == "EB":
+                out += b"\xe9" + struct.pack("<i", rel)
+            else:
+                out += bytes([0x0F, int(it[0], 16) + 0x10]) + struct.pack("<i", rel)
+        if not grew:
+            return bytes(out), labels
+
+
+def pm4_sanitizer(plts, cave_va):
+    """Code for `cave_va` that drops the {-1,-1} register-table placeholders (see PM4_SUBMITS)
+    before a command buffer is submitted. `plts` are the submit functions' PLT vaddrs; each
+    gets a thunk that saves the argument registers, runs the sanitizer on the descriptor in
+    rdi, restores them and jumps to the PLT stub. Point the game's calls at the thunks.
+
+    The sanitizer walks the buffer's PM4 packets and follows chained 0x3F jumps (the CHAIN
+    bit, up to 8 segments). For every 0x63/0x64/0x9F packet in table form ([3] == 0x80000000)
+    it compacts the table in place, dropping entries whose offset is 0xFFFFFFFF, and lowers
+    the pair count. A table left empty gets count 0 and address 0, a shape games already
+    submit and 4.03 runs. A clean table is not written. The walk stops at a type-0/1 dword
+    or an overrun. Returns ({plt vaddr: thunk vaddr}, code bytes)."""
+    prog = []
+    for k, _ in enumerate(plts):
+        prog += [("L", f"t{k}"),
+                 b"\x57\x56\x52\x51\x41\x50\x41\x51",       # push rdi, rsi, rdx, rcx, r8, r9
+                 ("E8", "san"),
+                 b"\x41\x59\x41\x58\x59\x5a\x5e\x5f",       # pop r9, r8, rcx, rdx, rsi, rdi
+                 ("E9", f"plt{k}")]
+    prog += [
+        ("L", "san"),
+        b"\x48\x8b\x37",                    # mov rsi, [rdi]        ; segment
+        b"\x8b\x4f\x08",                    # mov ecx, [rdi+8]      ; dwords
+        b"\x41\xbb\x08\x00\x00\x00",        # mov r11d, 8           ; max segments
+        ("L", "seg"),
+        b"\x48\x85\xf6", ("74", "done"),    # test rsi, rsi ; jz
+        b"\x85\xc9", ("74", "done"),        # test ecx, ecx ; jz
+        b"\x4c\x8d\x14\x8e",                # lea r10, [rsi+rcx*4]  ; segment end
+        ("L", "pkt"),
+        b"\x4c\x39\xd6", ("73", "done"),    # cmp rsi, r10 ; jae
+        b"\x8b\x06",                        # mov eax, [rsi]
+        b"\x89\xc2", b"\xc1\xea\x1e",       # mov edx, eax ; shr edx, 30
+        b"\x83\xfa\x03", ("74", "t3"),      # cmp edx, 3 ; je
+        b"\x83\xfa\x02", ("75", "done"),    # cmp edx, 2 ; jne      ; type 0/1: stop
+        b"\x48\x83\xc6\x04", ("EB", "pkt"),  # add rsi, 4 ; jmp      ; type-2 filler
+        ("L", "t3"),
+        b"\x89\xc2", b"\xc1\xea\x10",       # mov edx, eax ; shr edx, 16
+        b"\x81\xe2\xff\x3f\x00\x00",        # and edx, 0x3fff
+        b"\x83\xc2\x02",                    # add edx, 2
+        b"\x4c\x8d\x04\x96",                # lea r8, [rsi+rdx*4]   ; next packet
+        b"\x4d\x39\xd0", ("77", "done"),    # cmp r8, r10 ; ja
+        b"\x3d\x00\x63\x03\xc0", ("74", "reg"),
+        b"\x3d\x00\x64\x03\xc0", ("74", "reg"),
+        b"\x3d\x00\x9f\x03\xc0", ("74", "reg"),
+        b"\x3d\x00\x3f\x02\xc0", ("74", "jmp"),
+        ("L", "next"),
+        b"\x4c\x89\xc6", ("EB", "pkt"),     # mov rsi, r8 ; jmp
+        ("L", "reg"),
+        b"\x81\x7e\x0c\x00\x00\x00\x80", ("75", "next"),  # cmp dword [rsi+12], 0x80000000
+        b"\x4c\x8b\x4e\x04",                # mov r9, [rsi+4]       ; table
+        b"\x4d\x85\xc9", ("74", "next"),    # test r9, r9
+        b"\x8b\x4e\x10",                    # mov ecx, [rsi+16]     ; pairs
+        b"\x31\xc0", b"\x31\xd2",           # xor eax, eax (src) ; xor edx, edx (dst)
+        ("L", "cl"),
+        b"\x39\xc8", ("73", "cdone"),       # cmp eax, ecx ; jae
+        b"\x41\x83\x3c\xc1\xff", ("74", "skip"),   # cmp dword [r9+rax*8], -1 ; je
+        b"\x39\xd0", ("74", "keep"),        # cmp eax, edx ; je
+        b"\x49\x8b\x3c\xc1",                # mov rdi, [r9+rax*8]
+        b"\x49\x89\x3c\xd1",                # mov [r9+rdx*8], rdi
+        ("L", "keep"), b"\xff\xc2",         # inc edx
+        ("L", "skip"), b"\xff\xc0", ("EB", "cl"),  # inc eax ; jmp
+        ("L", "cdone"),
+        b"\x39\xca", ("74", "next"),        # cmp edx, ecx ; je     ; nothing dropped
+        b"\x89\x56\x10",                    # mov [rsi+16], edx
+        b"\x85\xd2", ("75", "next"),        # test edx, edx ; jnz
+        b"\x48\xc7\x46\x04\x00\x00\x00\x00",  # mov qword [rsi+4], 0 ; empty table: address 0
+        ("EB", "next"),
+        ("L", "jmp"),
+        b"\xf7\x46\x0c\x00\x00\x10\x00", ("74", "next"),  # test dword [rsi+12], CHAIN ; jz
+        b"\x48\x8b\x46\x04",                # mov rax, [rsi+4]      ; target
+        b"\x8b\x4e\x0c",                    # mov ecx, [rsi+12]
+        b"\x81\xe1\xff\xff\x0f\x00",        # and ecx, 0xfffff      ; dwords
+        b"\x48\x89\xc6",                    # mov rsi, rax
+        b"\x41\xff\xcb", ("75", "seg"),     # dec r11d ; jnz
+        ("L", "done"), b"\xc3",
+    ]
+    code, labels = _asm(prog, cave_va, {f"plt{k}": va for k, va in enumerate(plts)})
+    return {va: labels[f"t{k}"] for k, va in enumerate(plts)}, code

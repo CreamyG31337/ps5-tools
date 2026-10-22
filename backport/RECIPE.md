@@ -89,6 +89,7 @@ unmount and rebooted the console. Get files from the package or dump on the PC i
 | whole console laggy, system UI "no heart beat" in the log | game threads busy-polling (e.g. a wait stubbed to return at once or sleep briefly) | dump the threads; give the wait a real blocking stand-in |
 | `PRX_SCE_MODULE_LOAD_ERROR` on launch, `?? modules not in the exports table` in the report | the module imports a system library the target firmware doesn't have at all | pass `--absent-lib NAME=SUBSTITUTE` |
 | menus and UI draw fine, but the game scene is covered in magenta (Unity's error colour) or flickering blocks | GPU-side stand-ins don't match the newer SDK: the `sceAgcCreateInterpolantMapping` rename in `RENAMES` broke an SDK 17 Unity game | put a newer `libSceAgc.sprx` + `libSceAgcDriver.sprx` (SDK already lowered) in the game's `fakelib/` and rerun with `--provided-lib libSceAgc --provided-lib libSceAgcDriver` |
+| `GPU Bad packet error:Privilege reg ... opcode:0xc0...... 0 0 0x2bff`, then `0xa0d0c006 (GPU_FAULT_BAD_COMMAND_ASYNC)`, a minute or so in (the opcode varies) | the game's register tables hold the newer SDK's `{-1,-1}` "no register" placeholder, which the older GPU firmware writes to register 0x2bff | rerun with `--pm4-sanitize` (below) |
 
 **`--provided-lib NAME` (repeatable).** Treats `NAME` as a library the game brings itself, so its
 imports are not checked and get no stand-ins. Use it when a newer build of a system library goes into
@@ -110,6 +111,18 @@ per-module byte change at flat-ELF virtual address `VADDR` in module `INNER` (e.
 `backport.py` checks that the flat ELF has `OLDHEX` at `VADDR` (or `NEWHEX`, reported as
 `already`) before patching the SELF in place. `--patch-file` reads one spec per line (`#`
 comments allowed) so game-specific patch lists can be kept outside the repo.
+
+**`--pm4-sanitize`.** Some SDK 11+ engines leave a `{0xFFFFFFFF, 0xFFFFFFFF}` placeholder in
+the tables of indirect register loads (PM4 `0x63`/`0x64`/`0x9F`). Newer GPU firmware skips it;
+4.03's writes it to SH register `0x2C00 + 0xFFFFFFFF = 0x2BFF` and kills the game with
+"Privilege reg ... 0x2bff". The tables are filled by inlined engine code, so there is no single
+instruction to patch. With this flag every direct call to `sceAgcDriverSubmitDcb` /
+`sceAgcDriverAgrSubmitDcb` is pointed at a small routine appended to the exec segment (like the
+umtx trampoline). It walks the command buffer, follows chained jumps, drops the placeholder
+entries and lowers each table's count before the real submit. The report lists each redirected
+call (`pm4     call ...`). Found on Crimson Desert (SDK 11.00), where it stopped the fault; see
+`shims.PM4_SUBMITS`. It only touches direct `call`s: a game that submits through a function
+pointer, or through other submit functions, needs those added.
 
 To see what a thread is doing, a debugger that can read registers and stacks of all threads
 (ptrace `PT_GETLWPLIST`/`PT_GETREGS`) helps a lot. Check the obvious first: "stuck" may be a

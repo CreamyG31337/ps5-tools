@@ -5,6 +5,7 @@ to an overlay folder.
                        [--nids nids.csv] [--replace INNER=LOCAL ...] [--only REGEX]
                        [--absent-lib NAME=SUBSTITUTE ...] [--provided-lib NAME ...]
                        [--patch INNER:VADDR:OLDHEX:NEWHEX ...] [--patch-file FILE ...]
+                       [--pm4-sanitize]
 
 SOURCE is either an app0 folder dump (eboot.bin, sce_module/, ...) or a fake package .pkg.
 A .pkg is read with ProsperoPkgTool (see pkgtool/README.md), which also decodes
@@ -27,7 +28,9 @@ entirely and points the module's dependency on NAME at SUBSTITUTE in place. --pr
 treats NAME like a module the game ships: use it when a newer build of a system library goes
 into the game's fakelib/ (e.g. libSceAgc), so its imports get no stand-ins. --patch (or
 --patch-file) applies per-module byte changes at flat-ELF virtual addresses. --replace
-INNER=LOCAL copies a hand-made file into the overlay instead.
+INNER=LOCAL copies a hand-made file into the overlay instead. --pm4-sanitize is for games
+whose GPU commands use the "no register" placeholder older firmware rejects ("GPU Bad packet
+error:Privilege reg ... 0x2bff"): see shims.PM4_SUBMITS.
 
 The overlay is what a backport loader (e.g. ShadowMountPlus's backports folder) lays over the
 installed game. Input files must be fake-signed SELFs (fpkg/dump), not retail-encrypted ones.
@@ -240,7 +243,7 @@ def grow_exec_segment(data, extra):
     return True
 
 
-def patch_module(data, exports, shipped, sdk, names_db, absent=None, patches=()):
+def patch_module(data, exports, shipped, sdk, names_db, absent=None, patches=(), pm4=False):
     """Patch one fake-signed SELF in place. Returns (log lines, missing NIDs)."""
     absent = parse_absent(absent)
     orig = bytes(data)
@@ -303,16 +306,41 @@ def patch_module(data, exports, shipped, sdk, names_db, absent=None, patches=())
     libs = e.import_libs()
     # futex stand-ins: a shared trampoline appended to the exec segment gives every wait a
     # real kernel timeout (shims.umtx_cave); the paired-stub layout is the fallback
-    umtx, cave = {}, None
+    umtx, cave, tramp = {}, None, 0
     if "libkernel" in libs:
         stubs = {by_nid[n]: (shims.UMTX_SHIMS[n], elf_b[e.v2o(by_nid[n]):e.v2o(by_nid[n]) + 16])
                  for n in missing if n in shims.UMTX_SHIMS and n not in absent_nids and n in by_nid}
-        cave = exec_cave_va(data, e, len(shims.umtx_cave(stubs, 0)[1])) \
-            if any(op != shims.UMTX_WAKE for op, _ in stubs.values()) else None
-        if cave is not None:
+        if any(op != shims.UMTX_WAKE for op, _ in stubs.values()):
+            tramp = len(shims.umtx_cave(stubs, 0)[1])
+    # --pm4-sanitize: the game's calls to the command-buffer submit functions go through
+    # shims.pm4_sanitizer first; its code shares the grown exec segment with the trampoline
+    pm4_sites = sorted((s, t) for s, t in calls if pm4 and plt[t][:11] in shims.PM4_SUBMITS)
+    pm4_plts = sorted({t for _, t in pm4_sites})
+    pm4_len = len(shims.pm4_sanitizer(pm4_plts, 0)[1]) if pm4_sites else 0
+    if pm4_len:
+        cave = exec_cave_va(data, e, tramp + 15 + pm4_len)
+        if cave is None:
+            log.append("  !! pm4 sanitizer: no room at the end of the exec segment, NOT applied")
+            pm4_sites = []
+    if cave is None and tramp:
+        cave = exec_cave_va(data, e, tramp)
+    if "libkernel" in libs:
+        if tramp and cave is not None:
             umtx = shims.umtx_cave(stubs, cave)[0]
         else:
             umtx = shims.umtx_stubs(stubs) or {}
+    tail = shims.umtx_cave(stubs, cave)[1] if tramp and cave is not None else b""
+    if pm4_sites:
+        pm4_va = (cave + len(tail) + 0xF) & ~0xF
+        thunks, pm4_code = shims.pm4_sanitizer(pm4_plts, pm4_va)
+        tail = tail.ljust(pm4_va - cave, shims.PAD) + pm4_code
+        for site, tgt in pm4_sites:
+            new = b"\xe8" + struct.pack("<i", thunks[tgt] - (site + 5))
+            if shims.put(data, orig, elf_b, e.v2o(site), new):
+                log.append(f"  pm4     call {shims.PM4_SUBMITS[plt[tgt][:11]]} at {site:#x} -> "
+                           f"sanitizer {thunks[tgt]:#x}")
+            else:
+                log.append(f"  !!      pm4: call at {site:#x} has no unique spot in the SELF, NOT redirected")
     for nid in sorted(missing):
         label = f"{nid} {names.get(nid, '(unnamed)')}"
         if nid not in absent_nids and nid in shims.RENAMES and \
@@ -330,7 +358,7 @@ def patch_module(data, exports, shipped, sdk, names_db, absent=None, patches=())
                     shims.put(data, orig, elf_b, off, stub):
                 if shims.UMTX_SHIMS[nid] == shims.UMTX_WAKE:
                     kind = ""
-                elif cave:
+                elif tramp and cave is not None:
                     kind = ", trampoline wait"
                 else:
                     kind = ", timed waits return at once" if by_nid[nid] in umtx else ", timeout dropped"
@@ -363,12 +391,16 @@ def patch_module(data, exports, shipped, sdk, names_db, absent=None, patches=())
             raise PatchError(f"patch at {va:#x}: no unique spot in the SELF")
         else:
             log.append(f"  patch   {va:#x} {old.hex()} -> {new.hex()}")
-    if cave is not None:
+    if tail:
         # the stubs are in; move the patched segment to the end of the file with the
-        # trampoline as its tail (exec_cave_va already checked this cannot fail)
-        assert grow_exec_segment(data, shims.umtx_cave(stubs, cave)[1])
-        log.append(f"  umtx trampoline at {cave:#x} (exec segment grown): "
-                   "timed waits sleep in the kernel, ~1 s recheck slices")
+        # trampoline / sanitizer as its tail (exec_cave_va already checked this cannot fail)
+        assert grow_exec_segment(data, tail)
+        if tramp:
+            log.append(f"  umtx trampoline at {cave:#x} (exec segment grown): "
+                       "timed waits sleep in the kernel, ~1 s recheck slices")
+        if pm4_sites:
+            log.append(f"  pm4 sanitizer at {pm4_va:#x} ({len(pm4_code)} bytes, exec segment grown): "
+                       "drops {-1,-1} register-table placeholders before each submit")
     return log, missing
 
 
@@ -391,6 +423,9 @@ def main():
                     help="patch bytes at flat-ELF hex VADDR in module INNER")
     ap.add_argument("--patch-file", action="append", default=[], metavar="FILE",
                     help="file of INNER:VADDR:OLDHEX:NEWHEX patch specs (# comments allowed)")
+    ap.add_argument("--pm4-sanitize", action="store_true",
+                    help="route command-buffer submits through code that drops the {-1,-1} register-table "
+                         "placeholders older GPU firmware writes to register 0x2bff (see shims.PM4_SUBMITS)")
     a = ap.parse_args()
     try:
         absent = parse_absent(a.absent_lib)
@@ -422,7 +457,7 @@ def main():
         data = bytearray(open(paths[i], "rb").read())
         try:
             log, missing = patch_module(data, exports, shipped, a.sdk, a.nids,
-                                        absent=absent, patches=patches.get(i, ()))
+                                        absent=absent, patches=patches.get(i, ()), pm4=a.pm4_sanitize)
         except PatchError as ex:
             sys.exit(f"{i}: {ex}")
         except Exception as ex:  # e.g. retail-encrypted
