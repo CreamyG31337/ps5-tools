@@ -293,6 +293,13 @@ class TestShims(unittest.TestCase):
         self.assertEqual(pairs(3, 1), [(0x20, 4)])
         self.assertEqual(bytes(mu.mem_read(buf + 20, 12)), set_sh)        # other packets untouched
 
+    def test_wwise_714_sites(self):
+        sink = (b"\x90" * 4 + b"\xba" + struct.pack("<I", shims.AK_714) + b"\xb8" + struct.pack("<I", shims.AK_71)
+                + bytes.fromhex("807d1000") + bytes.fromhex("0f45c2") + b"\x90")
+        self.assertEqual(shims.wwise_714_sites(sink), [18])
+        self.assertEqual(shims.wwise_714_sites(sink.replace(b"\x0f\x45\xc2", b"\x0f\x44\xc2")), [])  # cmove: not it
+        self.assertEqual(shims.wwise_714_sites(b"\xb8" + struct.pack("<I", shims.AK_714)), [])
+
     def test_find_size_store(self):
         code = bytes.fromhex("90" * 10 + "48c745b030000000" + "488d75b0")
         self.assertEqual(shims.find_size_store(code, 0x30), 14)

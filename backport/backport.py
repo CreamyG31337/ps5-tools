@@ -5,7 +5,7 @@ to an overlay folder.
                        [--nids nids.csv] [--replace INNER=LOCAL ...] [--only REGEX]
                        [--absent-lib NAME=SUBSTITUTE ...] [--provided-lib NAME ...]
                        [--patch INNER:VADDR:OLDHEX:NEWHEX ...] [--patch-file FILE ...]
-                       [--pm4-sanitize]
+                       [--pm4-sanitize] [--audio-71]
 
 SOURCE is either an app0 folder dump (eboot.bin, sce_module/, ...) or a fake package .pkg.
 A .pkg is read with ProsperoPkgTool (see pkgtool/README.md), which also decodes
@@ -30,7 +30,8 @@ into the game's fakelib/ (e.g. libSceAgc), so its imports get no stand-ins. --pa
 --patch-file) applies per-module byte changes at flat-ELF virtual addresses. --replace
 INNER=LOCAL copies a hand-made file into the overlay instead. --pm4-sanitize is for games
 whose GPU commands use the "no register" placeholder older firmware rejects ("GPU Bad packet
-error:Privilege reg ... 0x2bff"): see shims.PM4_SUBMITS.
+error:Privilege reg ... 0x2bff"): see shims.PM4_SUBMITS. The report also flags audio the target
+can't play (`?? audio:` lines); --audio-71 fixes the Wwise 7.1.4 case.
 
 The overlay is what a backport loader (e.g. ShadowMountPlus's backports folder) lays over the
 installed game. Input files must be fake-signed SELFs (fpkg/dump), not retail-encrypted ones.
@@ -243,7 +244,32 @@ def grow_exec_segment(data, extra):
     return True
 
 
-def patch_module(data, exports, shipped, sdk, names_db, absent=None, patches=(), pm4=False):
+def audio_notes(data, orig, elf_b, e, by_nid, audio71=False):
+    """Report lines for audio the target firmware can't play (see shims.AUDIO_PORT_CREATE), and
+    with `audio71` the Wwise 7.1.4 -> 7.1 fix."""
+    log = []
+    t0, tva, tsz = e.text()
+    code = elf_b[t0:t0 + tsz]
+    if shims.AUDIO_PORT_CREATE in by_nid:
+        sites = shims.wwise_714_sites(code)
+        for o in sites:
+            if not audio71:
+                log.append(f"  ?? audio: Wwise picks a 7.1.4 output at {tva + o:#x}; 4.03 opens only 1/2/8 "
+                           "channels (sceAudioOut2PortCreate 0x8026800e, no sound). Rerun with --audio-71")
+            elif shims.put(data, orig, elf_b, t0 + o, b"\x0f\x1f\x00"):
+                log.append(f"  audio   Wwise 7.1.4 -> 7.1 at {tva + o:#x} (cmovne -> nop)")
+            else:
+                log.append(f"  !!      audio: Wwise cmov at {tva + o:#x} has no unique spot in the SELF, NOT patched")
+        if not sites and struct.pack("<I", shims.AK_714) in code:
+            log.append("  ?? audio: a 7.1.4 channel config (0x2d63f10c) is in the code, but not in the known "
+                       "Wwise pattern. If the game is silent, check what sceAudioOut2PortCreate returns")
+    if shims.ACM_PANNER in by_nid:
+        log.append("  ?? audio: uses sceAcm_Panner (object/3D audio). 4.03's kernel rejects its batches, so "
+                   "with headphones positional sounds may drop out (see RECIPE.md)")
+    return log
+
+
+def patch_module(data, exports, shipped, sdk, names_db, absent=None, patches=(), pm4=False, audio71=False):
     """Patch one fake-signed SELF in place. Returns (log lines, missing NIDs)."""
     absent = parse_absent(absent)
     orig = bytes(data)
@@ -369,6 +395,7 @@ def patch_module(data, exports, shipped, sdk, names_db, absent=None, patches=(),
             log.append(f"  {'shim' if nid in shims.KNOWN else 'ret 0':7} {label} {where}")
         else:
             log.append(f"  !!      {label}: no unique spot in the SELF, NOT patched")
+    log += audio_notes(data, orig, elf_b, e, by_nid, audio71)
     for item in patches or ():
         if isinstance(item, str):
             _, va, old, new = parse_patch_spec(item if item.count(":") >= 3 else f"_:{item}")
@@ -426,6 +453,8 @@ def main():
     ap.add_argument("--pm4-sanitize", action="store_true",
                     help="route command-buffer submits through code that drops the {-1,-1} register-table "
                          "placeholders older GPU firmware writes to register 0x2bff (see shims.PM4_SUBMITS)")
+    ap.add_argument("--audio-71", action="store_true",
+                    help="make Wwise's PS5 sink mix 7.1 instead of 7.1.4, which 4.03 can't open (see shims.WWISE_714)")
     a = ap.parse_args()
     try:
         absent = parse_absent(a.absent_lib)
@@ -457,7 +486,8 @@ def main():
         data = bytearray(open(paths[i], "rb").read())
         try:
             log, missing = patch_module(data, exports, shipped, a.sdk, a.nids,
-                                        absent=absent, patches=patches.get(i, ()), pm4=a.pm4_sanitize)
+                                        absent=absent, patches=patches.get(i, ()), pm4=a.pm4_sanitize,
+                                        audio71=a.audio_71)
         except PatchError as ex:
             sys.exit(f"{i}: {ex}")
         except Exception as ex:  # e.g. retail-encrypted

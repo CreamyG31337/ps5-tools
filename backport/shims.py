@@ -381,3 +381,27 @@ def pm4_sanitizer(plts, cave_va):
     ]
     code, labels = _asm(prog, cave_va, {f"plt{k}": va for k, va in enumerate(plts)})
     return {va: labels[f"t{k}"] for k, va in enumerate(plts)}, code
+
+
+# Audio that FW 4.03 can't play, found on Crimson Desert (SDK 11, Wwise). All of these functions
+# exist on 4.03, so the import check can't see the problem. backport.py names them in the report
+# (audio_notes).
+# - sceAudioOut2PortCreate: 4.03 only opens 1, 2 or 8 channel main ports. A 7.1.4 request (format
+#   0xc00) fails with 0x8026800e and the game is silent. Wwise's PS5 sink picks 7.1.4 itself: it
+#   loads AkChannelConfig 7.1 (0x0063F108) and 7.1.4 (0x2D63F10C) and cmovs to 7.1.4 when the
+#   system reports height speakers. --audio-71 turns that cmov into a NOP (WWISE_714). Patching
+#   only the port format is not enough: Wwise keeps mixing 12 channels into 8 and it crackles.
+# - sceAcm_Panner: with headphones connected, games switch to object (3D) audio, which pans through
+#   the ACM unit. On 4.03 the kernel rejects those batches (sceAcmBatchStartBuffers 0x81940006),
+#   so positional sounds drop out while music plays. Keeping the game out of headphone mode fixes it,
+#   but where it reads that flag is game-specific (Crimson Desert: two `and reg, 1` on the speaker-info headphone bit).
+AUDIO_PORT_CREATE = "JK2wamZPzwM"   # sceAudioOut2PortCreate
+ACM_PANNER = "LA4RCNKnFjg"          # sceAcm_Panner
+AK_71, AK_714 = 0x0063F108, 0x2D63F10C
+WWISE_714 = re.compile(re.escape(b"\xba" + struct.pack("<I", AK_714) + b"\xb8" + struct.pack("<I", AK_71)) +
+                       rb"(?:.{0,12}?)(\x0f\x45\xc2)", re.S)   # mov edx, 7.1.4; mov eax, 7.1; ...; cmovne eax, edx
+
+
+def wwise_714_sites(code):
+    """Offsets in `code` of the `cmovne eax, edx` that switches Wwise's PS5 sink to 7.1.4."""
+    return [m.start(1) for m in WWISE_714.finditer(code)]

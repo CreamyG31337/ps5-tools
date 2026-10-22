@@ -90,6 +90,8 @@ unmount and rebooted the console. Get files from the package or dump on the PC i
 | `PRX_SCE_MODULE_LOAD_ERROR` on launch, `?? modules not in the exports table` in the report | the module imports a system library the target firmware doesn't have at all | pass `--absent-lib NAME=SUBSTITUTE` |
 | menus and UI draw fine, but the game scene is covered in magenta (Unity's error colour) or flickering blocks | GPU-side stand-ins don't match the newer SDK: the `sceAgcCreateInterpolantMapping` rename in `RENAMES` broke an SDK 17 Unity game | put a newer `libSceAgc.sprx` + `libSceAgcDriver.sprx` (SDK already lowered) in the game's `fakelib/` and rerun with `--provided-lib libSceAgc --provided-lib libSceAgcDriver` |
 | `GPU Bad packet error:Privilege reg ... opcode:0xc0...... 0 0 0x2bff`, then `0xa0d0c006 (GPU_FAULT_BAD_COMMAND_ASYNC)`, a minute or so in (the opcode varies) | the game's register tables hold the newer SDK's `{-1,-1}` "no register" placeholder, which the older GPU firmware writes to register 0x2bff | rerun with `--pm4-sanitize` (below) |
+| no sound at all; `sceAudioOut2PortCreate` returns `0x8026800e`; report says `?? audio: Wwise picks a 7.1.4 output` | the game asks for a 12-channel (7.1.4) output, and 4.03 opens only 1, 2 or 8 channels | rerun with `--audio-71` (Wwise); for other engines, find where the port's channel count is chosen and make it 8 |
+| music plays, but positional sounds (wind, footsteps) drop out with headphones; `sceAcmBatchStartBuffers` returns `0x81940006`; report says `?? audio: uses sceAcm_Panner` | with headphones, the game switches to object (3D) audio, and 4.03's kernel rejects its ACM panner batches | keep the game out of headphone mode: find where it reads the headphone bit of `sceAudioOut2GetSpeakerInfo` and clear it (`--patch`) |
 
 **`--provided-lib NAME` (repeatable).** Treats `NAME` as a library the game brings itself, so its
 imports are not checked and get no stand-ins. Use it when a newer build of a system library goes into
@@ -123,6 +125,15 @@ entries and lowers each table's count before the real submit. The report lists e
 call (`pm4     call ...`). Found on Crimson Desert (SDK 11.00), where it stopped the fault; see
 `shims.PM4_SUBMITS`. It only touches direct `call`s: a game that submits through a function
 pointer, or through other submit functions, needs those added.
+
+**Audio: `?? audio:` report lines and `--audio-71`.** Audio failures happen inside functions the
+target exports, so the import check can't see them. `backport.py` flags the two known cases instead.
+A game that imports `sceAudioOut2PortCreate` and contains Wwise's 7.1 / 7.1.4 channel-config switch is
+reported. `--audio-71` makes that switch always choose 7.1, so Wwise mixes 8 channels and the port opens.
+Patching only the port's channel count is not enough: the mix stays 12-channel and crackles. A game
+that imports `sceAcm_Panner` gets a warning about headphone dropouts, which needs a game-specific
+patch. When a game is silent or drops sounds, log what every audio call returns with a debugger before
+guessing. Most of these calls return an error code, not a crash.
 
 To see what a thread is doing, a debugger that can read registers and stacks of all threads
 (ptrace `PT_GETLWPLIST`/`PT_GETREGS`) helps a lot. Check the obvious first: "stuck" may be a
