@@ -92,6 +92,7 @@ unmount and rebooted the console. Get files from the package or dump on the PC i
 | `GPU Bad packet error:Privilege reg ... opcode:0xc0...... 0 0 0x2bff`, then `0xa0d0c006 (GPU_FAULT_BAD_COMMAND_ASYNC)`, a minute or so in (the opcode varies) | the game's register tables hold the newer SDK's `{-1,-1}` "no register" placeholder, which the older GPU firmware writes to register 0x2bff | rerun with `--pm4-sanitize` (below) |
 | no sound at all; `sceAudioOut2PortCreate` returns `0x8026800e`; report says `?? audio: Wwise picks a 7.1.4 output` | the game asks for a 12-channel (7.1.4) output, and 4.03 opens only 1, 2 or 8 channels | rerun with `--audio-71` (Wwise); for other engines, find where the port's channel count is chosen and make it 8 |
 | music plays, but positional sounds (wind, footsteps) drop out with headphones; `sceAcmBatchStartBuffers` returns `0x81940006`; report says `?? audio: uses sceAcm_Panner` | with headphones, the game switches to object (3D) audio, and 4.03's kernel rejects its ACM panner batches | keep the game out of headphone mode: find where it reads the headphone bit of `sceAudioOut2GetSpeakerInfo` and clear it (`--patch`) |
+| installed as a `.pkg`, the game opens a message like "There may be a problem with the game installation. Please reinstall." and quits (`Returned from main with non-zero`, `0xa0020002`); report says `?? playgo:`. The same dump ran from a folder | the game asks PlayGo where each chunk of its data is, and 4.03's PlayGo answers some of a newer package's chunks with `0x80b20023` | rerun with `--playgo-local` (below) |
 
 **`--provided-lib NAME` (repeatable).** Treats `NAME` as a library the game brings itself, so its
 imports are not checked and get no stand-ins. Use it when a newer build of a system library goes into
@@ -134,6 +135,17 @@ Patching only the port's channel count is not enough: the mix stays 12-channel a
 that imports `sceAcm_Panner` gets a warning about headphone dropouts, which needs a game-specific
 patch. When a game is silent or drops sounds, log what every audio call returns with a debugger before
 guessing. Most of these calls return an error code, not a crash.
+
+**PlayGo: `?? playgo:` report lines and `--playgo-local`.** A game installed as a package can ask
+`scePlayGoGetLocus` which chunks of its data are on the drive before it opens them. For a newer package,
+4.03's PlayGo can answer with `0x80b20023` instead of "local". The game then decides its installation
+is broken, shows its own "please reinstall" message and exits. A third-party backport of the same game
+fails the same way, because the check is in the game's own startup. Run from a folder, PlayGo isn't
+involved, which is why the same dump can work there. `--playgo-local` replaces the import's PLT stub with
+12 bytes that mark every requested chunk as local (3) and return 0. That is true for a fake package,
+which installs in full. Found on Crimson Desert (Enhanced, SDK 11.00), where the error came from chunk
+group `packages/0030`. The report lists every game that imports the function, including games that run
+fine, so only use the flag when the game reports a broken install.
 
 To see what a thread is doing, a debugger that can read registers and stacks of all threads
 (ptrace `PT_GETLWPLIST`/`PT_GETREGS`) helps a lot. Check the obvious first: "stuck" may be a

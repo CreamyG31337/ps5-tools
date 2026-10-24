@@ -300,6 +300,26 @@ class TestShims(unittest.TestCase):
         self.assertEqual(shims.wwise_714_sites(sink.replace(b"\x0f\x45\xc2", b"\x0f\x44\xc2")), [])  # cmove: not it
         self.assertEqual(shims.wwise_714_sites(b"\xb8" + struct.pack("<I", shims.AK_714)), [])
 
+    def test_playgo_all_local_runs(self):
+        from unicorn import Uc, UC_ARCH_X86, UC_MODE_64
+        from unicorn.x86_const import UC_X86_REG_RAX, UC_X86_REG_RCX, UC_X86_REG_RDX, UC_X86_REG_RSP
+        code_va, loci, stack = 0x10000, 0x20000, 0x30000
+        mu = Uc(UC_ARCH_X86, UC_MODE_64)
+        for base in (code_va, loci, stack):
+            mu.mem_map(base, 0x10000)
+        mu.mem_map(0xDEAD0000, 0x1000)
+        mu.mem_write(code_va, shims.PLAYGO_ALL_LOCAL)
+        mu.mem_write(loci, b"\x07" * 8)
+        mu.mem_write(stack + 0x800, struct.pack("<Q", 0xDEAD0000))
+        mu.reg_write(UC_X86_REG_RSP, stack + 0x800)
+        mu.reg_write(UC_X86_REG_RCX, loci)
+        mu.reg_write(UC_X86_REG_RDX, 5)
+        mu.reg_write(UC_X86_REG_RAX, 0x80B20023)
+        mu.emu_start(code_va, 0xDEAD0000, count=1000)
+        self.assertEqual(bytes(mu.mem_read(loci, 8)), b"\x03" * 5 + b"\x07" * 3)
+        self.assertEqual(mu.reg_read(UC_X86_REG_RAX), 0)
+        self.assertLessEqual(len(shims.PLAYGO_ALL_LOCAL), 16)
+
     def test_find_size_store(self):
         code = bytes.fromhex("90" * 10 + "48c745b030000000" + "488d75b0")
         self.assertEqual(shims.find_size_store(code, 0x30), 14)
@@ -435,6 +455,30 @@ class TestPatchModule(unittest.TestCase):
         plain_out = bytes(selflib.rebuild_flat_elf(bytes(plain)))
         self.assertEqual(plain_out[TEXT_OFF + site:TEXT_OFF + site + 5],
                          self_flat_call(site, PLT["presets"]))
+
+    def test_playgo_local(self):
+        # pretend the exported presets import is scePlayGoGetLocus: flagged without the option,
+        # its PLT stub replaced with it
+        _, raw = build_module()
+        saved = shims.PLAYGO_GET_LOCUS
+        shims.PLAYGO_GET_LOCUS = "-sD02mFDBh4"
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                ex = os.path.join(tmp, "exports.tsv")
+                write_exports(ex)
+                exports = backport.load_exports(ex)
+            plain = bytearray(raw)
+            plain_log, _ = backport.patch_module(plain, exports, set(), 0x04000031, None)
+            data = bytearray(raw)
+            log, _ = backport.patch_module(data, exports, set(), 0x04000031, None, playgo_local=True)
+        finally:
+            shims.PLAYGO_GET_LOCUS = saved
+        self.assertTrue(any(line.lstrip().startswith("?? playgo:") for line in plain_log))
+        self.assertEqual(bytes(selflib.rebuild_flat_elf(bytes(plain)))[TEXT_OFF + 0x80:TEXT_OFF + 0x82], b"\xff\x25")
+        out = bytes(selflib.rebuild_flat_elf(bytes(data)))
+        t = TEXT_OFF + PLT["presets"]
+        self.assertEqual(out[t:t + 16], shims.PLAYGO_ALL_LOCAL.ljust(16, shims.PAD))
+        self.assertTrue(any(line.lstrip().startswith("playgo  scePlayGoGetLocus") for line in log))
 
     def test_byte_patch_and_error(self):
         _, raw = build_module()

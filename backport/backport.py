@@ -5,7 +5,7 @@ to an overlay folder.
                        [--nids nids.csv] [--replace INNER=LOCAL ...] [--only REGEX]
                        [--absent-lib NAME=SUBSTITUTE ...] [--provided-lib NAME ...]
                        [--patch INNER:VADDR:OLDHEX:NEWHEX ...] [--patch-file FILE ...]
-                       [--pm4-sanitize] [--audio-71]
+                       [--pm4-sanitize] [--audio-71] [--playgo-local]
 
 SOURCE is either an app0 folder dump (eboot.bin, sce_module/, ...) or a fake package .pkg.
 A .pkg is read with ProsperoPkgTool (see pkgtool/README.md), which also decodes
@@ -31,7 +31,9 @@ into the game's fakelib/ (e.g. libSceAgc), so its imports get no stand-ins. --pa
 INNER=LOCAL copies a hand-made file into the overlay instead. --pm4-sanitize is for games
 whose GPU commands use the "no register" placeholder older firmware rejects ("GPU Bad packet
 error:Privilege reg ... 0x2bff"): see shims.PM4_SUBMITS. The report also flags audio the target
-can't play (`?? audio:` lines); --audio-71 fixes the Wwise 7.1.4 case.
+can't play (`?? audio:` lines); --audio-71 fixes the Wwise 7.1.4 case. A `?? playgo:` line means
+the game checks where PlayGo says its data is; if the installed .pkg then reports itself broken,
+--playgo-local makes every chunk count as installed.
 
 The overlay is what a backport loader (e.g. ShadowMountPlus's backports folder) lays over the
 installed game. Input files must be fake-signed SELFs (fpkg/dump), not retail-encrypted ones.
@@ -269,7 +271,22 @@ def audio_notes(data, orig, elf_b, e, by_nid, audio71=False):
     return log
 
 
-def patch_module(data, exports, shipped, sdk, names_db, absent=None, patches=(), pm4=False, audio71=False):
+def playgo_notes(data, orig, elf_b, e, by_nid, playgo_local=False):
+    """Report line for a game that checks PlayGo chunk loci, and with `playgo_local` the
+    every-chunk-is-local stub (see shims.PLAYGO_GET_LOCUS)."""
+    va = by_nid.get(shims.PLAYGO_GET_LOCUS)
+    if va is None:
+        return []
+    if not playgo_local:
+        return [f"  ?? playgo: asks scePlayGoGetLocus (PLT {va:#x}) where its data is. Installed as a .pkg, 4.03 "
+                "can answer 0x80b20023 and the game says its installation is broken. If so, rerun with --playgo-local"]
+    if shims.put(data, orig, elf_b, e.v2o(va), shims.PLAYGO_ALL_LOCAL.ljust(16, shims.PAD)):
+        return [f"  playgo  scePlayGoGetLocus (PLT {va:#x}) -> every chunk local"]
+    return [f"  !!      playgo: scePlayGoGetLocus PLT {va:#x} has no unique spot in the SELF, NOT patched"]
+
+
+def patch_module(data, exports, shipped, sdk, names_db, absent=None, patches=(), pm4=False, audio71=False,
+                 playgo_local=False):
     """Patch one fake-signed SELF in place. Returns (log lines, missing NIDs)."""
     absent = parse_absent(absent)
     orig = bytes(data)
@@ -396,6 +413,7 @@ def patch_module(data, exports, shipped, sdk, names_db, absent=None, patches=(),
         else:
             log.append(f"  !!      {label}: no unique spot in the SELF, NOT patched")
     log += audio_notes(data, orig, elf_b, e, by_nid, audio71)
+    log += playgo_notes(data, orig, elf_b, e, by_nid, playgo_local)
     for item in patches or ():
         if isinstance(item, str):
             _, va, old, new = parse_patch_spec(item if item.count(":") >= 3 else f"_:{item}")
@@ -455,6 +473,9 @@ def main():
                          "placeholders older GPU firmware writes to register 0x2bff (see shims.PM4_SUBMITS)")
     ap.add_argument("--audio-71", action="store_true",
                     help="make Wwise's PS5 sink mix 7.1 instead of 7.1.4, which 4.03 can't open (see shims.WWISE_714)")
+    ap.add_argument("--playgo-local", action="store_true",
+                    help="report every PlayGo chunk as installed, for a .pkg install that says it's broken "
+                         "(see shims.PLAYGO_GET_LOCUS)")
     a = ap.parse_args()
     try:
         absent = parse_absent(a.absent_lib)
@@ -487,7 +508,7 @@ def main():
         try:
             log, missing = patch_module(data, exports, shipped, a.sdk, a.nids,
                                         absent=absent, patches=patches.get(i, ()), pm4=a.pm4_sanitize,
-                                        audio71=a.audio_71)
+                                        audio71=a.audio_71, playgo_local=a.playgo_local)
         except PatchError as ex:
             sys.exit(f"{i}: {ex}")
         except Exception as ex:  # e.g. retail-encrypted

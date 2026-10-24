@@ -405,3 +405,15 @@ WWISE_714 = re.compile(re.escape(b"\xba" + struct.pack("<I", AK_714) + b"\xb8" +
 def wwise_714_sites(code):
     """Offsets in `code` of the `cmovne eax, edx` that switches Wwise's PS5 sink to 7.1.4."""
     return [m.start(1) for m in WWISE_714.finditer(code)]
+
+
+# PlayGo: a game installed as a .pkg asks scePlayGoGetLocus(handle, chunkIds, count, outLoci) where
+# each chunk of its data lives, and only trusts chunks reported as local (3). For a newer game's
+# package the 4.03 PlayGo answers some chunks with 0x80b20023 instead; Crimson Desert then shows its
+# own "There may be a problem with the game installation. Please reinstall." and returns from main
+# (exception 0xa0020002). Run from a folder, PlayGo never comes into it. --playgo-local replaces the
+# import's PLT stub with "every chunk is local, return 0", which is true once the whole package is
+# installed (fake packages install in full; nothing streams in later).
+#   mov rdi, rcx; mov ecx, edx; mov al, 3; rep stosb; xor eax, eax; ret
+PLAYGO_GET_LOCUS = "uWIYLFkkwqk"    # scePlayGoGetLocus
+PLAYGO_ALL_LOCAL = bytes.fromhex("4889cf89d1b003f3aa31c0c3")
